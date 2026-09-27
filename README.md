@@ -5,11 +5,15 @@ and adds beat-synced effects, color grading and export options.
 
 Runs as a **Windows desktop app**, or as a local web app in your browser.
 
+### ⬇ [Download BeatSync for Windows](https://github.com/YOUR_GITHUB_USERNAME/beatsync/releases/latest/download/BeatSync-Setup.exe)
+
+Windows 10/11 · free · no admin rights needed
+
 ---
 
 ## Use the desktop app
 
-1. Download `BeatSync-Setup-x.y.z.exe` from the **Releases** page and run it. It needs no admin rights.
+1. Click **Download** above, then run `BeatSync-Setup.exe`.
 2. On first launch, BeatSync offers to download its free tools (about 215 MB, one time):
    - **ffmpeg**: required
    - **yt-dlp + Deno**: only needed for links (YouTube, TikTok, …)
@@ -26,6 +30,15 @@ Click **More info → Run anyway**.
 | Tools, settings, cookies | `%LOCALAPPDATA%\BeatSync` |
 | Temp files | `%LOCALAPPDATA%\BeatSync\temp`, deleted on close and on every start |
 | Log | `%LOCALAPPDATA%\BeatSync\logs\beatsync.log` (Settings → Open logs) |
+
+### If BeatSync doesn't open
+
+1. Open Task Manager, end every **BeatSync** process, and try again.
+2. Run `BeatSync.exe --debug` from a terminal. A console window shows what happens during startup.
+3. Send `%LOCALAPPDATA%\BeatSync\logs\beatsync.log` along with your bug report.
+
+If the window never appears, the Microsoft Edge WebView2 Runtime is usually missing. BeatSync then offers
+to open Microsoft's download page.
 
 ---
 

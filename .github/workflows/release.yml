@@ -65,6 +65,9 @@ jobs:
           $url = "https://github.com/${{ github.repository }}"
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DAppVersion=$v" "/DAppURL=$url" build/installer.iss
           Compress-Archive -Path dist/BeatSync/* -DestinationPath "dist/BeatSync-portable-$v.zip"
+          # Same installer under a fixed name, so one permanent link always gets the newest version:
+          #   https://github.com/<you>/beatsync/releases/latest/download/BeatSync-Setup.exe
+          Copy-Item "dist/BeatSync-Setup-$v.exe" "dist/BeatSync-Setup.exe"
 
       # Optional code signing: once SignPath.io approves the project, add their
       # "signpath/github-action-submit-signing-request" step here for the .exe files.
@@ -73,7 +76,7 @@ jobs:
         with:
           name: BeatSync-windows
           path: |
-            dist/BeatSync-Setup-*.exe
+            dist/BeatSync-Setup.exe
             dist/BeatSync-portable-*.zip
 
       - name: Publish GitHub Release
@@ -81,6 +84,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/BeatSync-Setup.exe
             dist/BeatSync-Setup-*.exe
             dist/BeatSync-portable-*.zip
           generate_release_notes: true
