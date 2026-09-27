@@ -294,16 +294,17 @@ def install(name, target_dir=None, progress=None):
     """Download and install one tool (blocking). Returns a status message."""
     target = Path(target_dir) if target_dir else USER_BIN
     target.mkdir(parents=True, exist_ok=True)
-    _set(name, state='installing', pct=1, msg='Finding the latest version…', error=None)
+    _set(name, state='installing', pct=1, msg='Finding the latest version...', error=None)
     work = tempfile.mkdtemp(prefix=f'dl_{name}_', dir=str(data_dir()))
     try:
         url = _resolve_url(name)
         fname = url.rsplit('/', 1)[-1].split('?')[0] or name
         archive = os.path.join(work, fname)
         _download(url, archive, name, 2, 90)
-        _set(name, pct=92, msg='Unpacking…')
-        stage = os.path.join(work, 'stage')
-        os.makedirs(stage)
+        _set(name, pct=92, msg='Unpacking...')
+        # Stage inside the target folder: the final rename then never crosses drives
+        # (e.g. download on C:, app or repo on D:), which Windows refuses to do.
+        stage = tempfile.mkdtemp(prefix='.stage_', dir=str(target))
         if archive.endswith(('.zip', '.tar.xz', '.tar.gz', '.tgz')):
             files = _extract(archive, name, stage)
         else:
@@ -317,7 +318,8 @@ def install(name, target_dir=None, progress=None):
             try:
                 os.replace(src, dst)
             except PermissionError:
-                raise RuntimeError(f'{f} is in use — wait for the current render to finish, then retry.')
+                raise RuntimeError(f'{f} is in use - wait for the current render to finish, then retry.')
+        shutil.rmtree(stage, ignore_errors=True)
         _ver_cache.clear()
         v = version(name) if target == USER_BIN else None
         msg = f'Installed {TOOLS[name]["label"]}' + (f' {v}' if v and v != 'installed' else '')
@@ -330,6 +332,8 @@ def install(name, target_dir=None, progress=None):
         raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        for leftover in target.glob('.stage_*'):
+            shutil.rmtree(leftover, ignore_errors=True)
 
 
 def _worker():
@@ -353,7 +357,7 @@ def install_async(names):
         for n in names:
             if n in TOOLS and n not in _queue and _jobs.get(n, {}).get('state') not in ('installing', 'queued'):
                 _queue.append(n)
-                _jobs[n] = {'state': 'queued', 'pct': 0, 'msg': 'Waiting…', 'error': None}
+                _jobs[n] = {'state': 'queued', 'pct': 0, 'msg': 'Waiting...', 'error': None}
         if _queue_thread is None and _queue:
             _queue_thread = threading.Thread(target=_worker, daemon=True)
             _queue_thread.start()
@@ -412,7 +416,7 @@ def update(names=('yt-dlp', 'deno')):
         if not cmd:
             out[name] = 'no self-update'
             continue
-        _set(name, state='installing', pct=50, msg='Updating…', error=None)
+        _set(name, state='installing', pct=50, msg='Updating...', error=None)
         before = version(name)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, **NO_WINDOW)
