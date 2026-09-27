@@ -1,0 +1,11 @@
+flask>=3.0
+flask-cors
+yt-dlp[default]
+librosa>=0.10
+soundfile
+numpy
+scipy
+pyrubberband
+pycryptodomex
+brotli
+websockets

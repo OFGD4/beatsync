@@ -1,0 +1,11 @@
+# Desktop app build (Windows). yt-dlp, ffmpeg and Deno are NOT Python packages here:
+# the app downloads their standalone programs on first run so they can self-update.
+flask>=3.0
+flask-cors
+librosa>=0.10
+soundfile
+numpy
+scipy
+pyrubberband
+pywebview>=5.0
+pyinstaller>=6.10

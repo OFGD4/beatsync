@@ -1,0 +1,86 @@
+# Builds the Windows app on GitHub's servers.
+#   - Every push of a tag like v3.0.1 → builds and publishes a GitHub Release
+#   - "Run workflow" button (Actions tab) → builds and uploads the files as an artifact
+name: Build Windows app
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-desktop.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-desktop.txt
+
+      - name: Use the tag as the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          (Get-Content app_info.py) -replace "APP_VERSION = '.*'", "APP_VERSION = '$v'" | Set-Content app_info.py
+
+      - name: Bundle Rubber Band
+        run: python build/get_tools.py rubberband
+
+      - name: Build BeatSync.exe
+        run: python -m PyInstaller build/beatsync.spec --noconfirm --clean --workpath .pyi-work --distpath dist
+
+      - name: Add bundled tools
+        shell: pwsh
+        run: if (Test-Path build/bin) { Copy-Item build/bin dist/BeatSync/bin -Recurse -Force }
+
+      - name: Smoke test (engine starts and answers)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/BeatSync/BeatSync.exe -ArgumentList '--headless', '--port', '5199' -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep 2
+            try { if ((Invoke-WebRequest http://127.0.0.1:5199/api/caps -UseBasicParsing).StatusCode -eq 200) { $ok = $true; break } } catch {}
+          }
+          Stop-Process $p.Id -Force
+          if (-not $ok) { Get-Content "$env:LOCALAPPDATA/BeatSync/logs/beatsync.log" -ErrorAction SilentlyContinue; exit 1 }
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $v = python -c "import app_info; print(app_info.APP_VERSION)"
+          $url = "https://github.com/${{ github.repository }}"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DAppVersion=$v" "/DAppURL=$url" build/installer.iss
+          Compress-Archive -Path dist/BeatSync/* -DestinationPath "dist/BeatSync-portable-$v.zip"
+
+      # Optional code signing: once SignPath.io approves the project, add their
+      # "signpath/github-action-submit-signing-request" step here for the .exe files.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BeatSync-windows
+          path: |
+            dist/BeatSync-Setup-*.exe
+            dist/BeatSync-portable-*.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/BeatSync-Setup-*.exe
+            dist/BeatSync-portable-*.zip
+          generate_release_notes: true
