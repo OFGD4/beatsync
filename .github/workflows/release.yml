@@ -67,7 +67,7 @@ jobs:
           Compress-Archive -Path dist/BeatSync/* -DestinationPath "dist/BeatSync-portable-$v.zip"
           # Same installer under a fixed name, so one permanent link always gets the newest version:
           #   https://github.com/<you>/beatsync/releases/latest/download/BeatSync-Setup.exe
-          Copy-Item "dist/BeatSync-Setup-$v.exe" "dist/BeatSync-Setup.exe"
+          Move-Item "dist/BeatSync-Setup-$v.exe" "dist/BeatSync-Setup.exe"
 
       # Optional code signing: once SignPath.io approves the project, add their
       # "signpath/github-action-submit-signing-request" step here for the .exe files.
@@ -85,6 +85,5 @@ jobs:
         with:
           files: |
             dist/BeatSync-Setup.exe
-            dist/BeatSync-Setup-*.exe
             dist/BeatSync-portable-*.zip
           generate_release_notes: true
