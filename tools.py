@@ -494,8 +494,45 @@ def check_app_update(force=False):
     try:
         rel = _http_json(f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', timeout=10)
         res.update(latest=rel.get('tag_name', ''), url=rel.get('html_url', ''),
+                   setup_url=next((a['browser_download_url'] for a in rel.get('assets', [])
+                                   if a.get('name', '').endswith('-Setup.exe')), ''),
                    newer=_vtuple(rel.get('tag_name')) > _vtuple(APP_VERSION))
     except Exception as e:
         res['error'] = str(e)[:200]
     _app_update.update(checked=time.time(), result=res)
     return res
+
+
+def start_app_update(on_ready):
+    """Download the newest BeatSync Setup in the background, then call on_ready(path)."""
+    res = check_app_update(force=True)
+    if not res.get('newer') or not res.get('setup_url'):
+        return {'ok': False, 'error': 'No update available.'}
+    with _lock:
+        if _jobs.get('app-update', {}).get('state') in ('downloading', 'launching'):
+            return {'ok': True}                                 # already running
+        _jobs['app-update'] = {'state': 'downloading', 'pct': 0, 'msg': 'Starting download...', 'error': None}
+
+    def work():
+        try:
+            dest = Path(tempfile.gettempdir()) / 'BeatSync-Setup.exe'
+            _download(res['setup_url'], dest, 'app-update', 0, 100)
+            _set('app-update', state='launching', pct=100, msg='Installing...')
+            on_ready(dest)
+        except Exception as e:
+            _set('app-update', state='error', msg='', error=str(e)[:200])
+
+    threading.Thread(target=work, daemon=True).start()
+    return {'ok': True}
+
+
+def app_update_status():
+    with _lock:
+        return dict(_jobs.get('app-update', {}))
+
+def just_updated_from():
+    """First launch after an update? Returns the old version (only once), else ''."""
+    prev = _load_state().get('last_version', '')
+    if prev != APP_VERSION:
+        _save_state(last_version=APP_VERSION)
+    return prev if prev and prev != APP_VERSION else ''

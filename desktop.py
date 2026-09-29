@@ -395,6 +395,32 @@ class Api:
             webbrowser.open(url)
             return True
         return False
+    def install_update(self):
+        
+        if not tools.FROZEN:
+            return {'ok': False, 'error': 'Updates can only be installed in the installed app.'}
+        if self._server._active_jobs():
+            return {'ok': False, 'error': 'Finish or cancel the running render first.'}
+        return tools.start_app_update(on_ready=self._run_setup)
+
+    def update_status(self):
+        return tools.app_update_status()
+
+    def pop_updated_from(self):
+        old = STATE.pop('updated_from', '')
+        return {'from': old, 'to': APP_VERSION} if old else None
+
+    def _run_setup(self, path):
+        log = tools.logs_dir() / 'update-setup.log'
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')
+        subprocess.Popen([str(path), '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+                          '/CLOSEAPPLICATIONS', '/FORCECLOSEAPPLICATIONS', f'/LOG={log}'], env=env)
+        logging.info('update: started %s, quitting', path)
+        try:
+            self._server.wipe_temp()
+            PID_FILE.unlink(missing_ok=True)
+        finally:
+            os._exit(0)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -453,6 +479,7 @@ def run(args, log_path):
     logging.info('loading window component')
     import webview
     hook_dotnet_errors(log_path)
+    STATE['updated_from'] = tools.just_updated_from() if tools.FROZEN else ''
     api = Api()
     api._server = server
     window = webview.create_window(

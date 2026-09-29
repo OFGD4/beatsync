@@ -1413,11 +1413,49 @@
         $('about-update').textContent = u.latest + ' available';
         $('update-text').textContent = 'BeatSync ' + u.latest + ' is available (you have ' + u.current + ').';
         $('update-banner').classList.add('show');
+        labelUpdateButton();
       } else $('about-update').textContent = 'up to date';
     } catch (e) {}
   }
   $('check-update').addEventListener('click', () => checkAppUpdate(true));
-  $('update-get').addEventListener('click', () => { if (S.appUpdate && S.appUpdate.url) openUrl(S.appUpdate.url); });
+  function canSelfUpdate() { return isDesktop() && !!window.pywebview.api.install_update && !!(S.appUpdate && S.appUpdate.setup_url); }
+  function labelUpdateButton() {
+    const b = $('update-get');
+    b.classList.remove('hidden');
+    b.textContent = canSelfUpdate() ? 'Update now' : 'Download';
+  }
+  window.addEventListener('pywebviewready', labelUpdateButton);
+
+  window.addEventListener('pywebviewready', async () => {
+    const api = window.pywebview.api;
+    if (!api.pop_updated_from) return;
+    const u = await api.pop_updated_from();
+    if (!u) return;
+    $('update-text').textContent = 'BeatSync was updated to ' + u.to + ' (from ' + u.from + ').';
+    $('update-get').classList.add('hidden');
+    $('update-banner').classList.add('show');
+  });
+
+  $('update-get').addEventListener('click', async () => {
+    if (!S.appUpdate) return;
+    if (!canSelfUpdate()) { if (S.appUpdate.url) openUrl(S.appUpdate.url); return; }
+    const btn = $('update-get');
+    btn.disabled = true;
+    const r = await window.pywebview.api.install_update();
+    if (!r || !r.ok) { toast((r && r.error) || 'Update failed', 'error'); btn.disabled = false; return; }
+    const poll = setInterval(async () => {
+      const s = await window.pywebview.api.update_status();
+      if (s.state === 'error') {
+        clearInterval(poll);
+        $('update-text').textContent = 'Update failed: ' + s.error;
+        btn.textContent = 'Retry'; btn.disabled = false;
+      } else if (s.state === 'launching') {
+        $('update-text').textContent = 'Installing ' + S.appUpdate.latest + '... BeatSync will restart.';
+      } else if (s.msg) {
+        $('update-text').textContent = s.msg + (s.pct ? ' (' + s.pct + '%)' : '');
+      }
+    }, 500);
+  });
   $('open-repo').addEventListener('click', () => { if (S.appUpdate && S.appUpdate.enabled) openUrl(S.appUpdate.url ? S.appUpdate.url.split('/releases')[0] : ''); });
 
   // First launch: show setup if something is missing

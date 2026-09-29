@@ -15,7 +15,7 @@ AppId={{8C1B8A3E-5B7E-4F1B-9D3A-2B6F0E7C4A11}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=BeatSync contributors
+AppPublisher=OFGD
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
 DefaultDirName={localappdata}\Programs\{#AppName}
@@ -34,7 +34,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-CloseApplications=yes
+CloseApplications=force
 RestartApplications=no
 
 [Tasks]
@@ -53,7 +53,7 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Start BeatSync"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "Start BeatSync"; Flags: nowait postinstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -71,6 +71,20 @@ begin
          or (RegQueryStringValue(HKCU, WebView2Key, 'pv', V) and (V <> '') and (V <> '0.0.0.0'));
 end;
 
+procedure KillBeatSync();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillBeatSync();
+  Result := '';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Code: Integer;
@@ -83,6 +97,9 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
+  if CurUninstallStep = usUninstall then
+    KillBeatSync();
+
   if CurUninstallStep = usPostUninstall then
     if MsgBox('Also delete downloaded tools, settings and temporary files?' + #13#10 +
               ExpandConstant('{localappdata}\BeatSync'), mbConfirmation, MB_YESNO) = IDYES then
