@@ -4,7 +4,7 @@ yt-dlp[default]
 librosa>=0.10
 soundfile
 numpy
-scipy
+scipy>=1.15          # fast 1-D median filter (HPSS ~5x faster)
 pyrubberband
 pycryptodomex
 brotli

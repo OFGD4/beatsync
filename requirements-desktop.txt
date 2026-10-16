@@ -5,7 +5,7 @@ flask-cors
 librosa>=0.10
 soundfile
 numpy
-scipy
+scipy>=1.15          # fast 1-D median filter (HPSS ~5x faster)
 pyrubberband
 pywebview>=5.0
 pyinstaller>=6.10

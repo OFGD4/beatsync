@@ -23,6 +23,9 @@ Windows 10/11 · free · no admin rights needed
 Windows may show "Windows protected your PC" because the app isn't code-signed yet.
 Click **More info → Run anyway**.
 
+**Big files:** click the drop box to pick a file. The app reads it where it is, with no upload
+or copy. Dragging a file in still works, but it copies the file first.
+
 ### Where things live
 
 | What | Where |

@@ -1,0 +1,35 @@
+# Changelog
+
+## 3.2.1
+
+Much faster with big video files, with the same beat analysis as 3.2.0 and no loss of quality.
+
+**Faster**
+- Beat nudges, pitch and mix changes no longer re-encode the video. Each look (filters, effects,
+  aspect, speed, quality) is encoded once, and later changes only swap the audio: seconds instead
+  of minutes. Beat effects still re-render on a nudge, because they move with the beat.
+- The full export starts in the background while the audio is analysed and the preview renders.
+  A new adjustment joins that encode instead of restarting it.
+- Trimming a video no longer re-encodes the whole clip before analysis. The trim is applied
+  frame-accurately during the export, so there is one encode instead of two (sharper result).
+- H.265/HEVC videos with no picture changes are copied straight into the MP4 (lossless and
+  instant). They used to be re-encoded to H.264.
+- Desktop: clicking the drop box picks the file in place (no upload, no copy). Saving a finished
+  file on the same drive is instant (hard link).
+- Beat analysis is faster with identical results: an exact but much faster median filter for the
+  harmonic/percussive split, video and song analysed in parallel, and both song versions
+  (pitch-locked and turntable) made at the same time.
+- The video and the song are downloaded or decoded at the same time.
+- Previews of 1080p/4K videos shrink to 720p before colour and effects are applied (unless grain,
+  sharpen, denoise, scanlines or glitch are on, which depend on pixel size).
+- The full-song MP3 is built after the export (or on download) instead of delaying every export.
+- With the song mixed with the video's own audio, that audio is decoded once per session, instead
+  of the whole video file being read again on every export.
+
+**Fixed**
+- A cmd window opened for every ffmpeg run (adding a video, rendering).
+- Temp files from older adjustments are deleted as you go. Before, every nudge left a full-size
+  export on disk until the session ended.
+- A failed song download stops the video download straight away and shows the real error.
+- Uploading a file with a non-Latin name (Arabic, etc.) no longer fails with "Unsupported file type".
+- The temp-size readout no longer counts hard-linked uploads twice.

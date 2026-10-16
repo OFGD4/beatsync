@@ -28,7 +28,9 @@ import time
 import math
 import shutil
 import tempfile
+import hashlib
 import collections
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from werkzeug.utils import secure_filename
 
@@ -55,7 +57,7 @@ class _UploadRequest(Request):
 app = Flask(__name__)
 app.request_class = _UploadRequest
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024 * 1024  # 20 GB (long 4K videos)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 ** 3    # uploads go straight to disk; local app
 
 # cookies.txt (Netscape format) helps with YouTube "Sign in to confirm" checks.
 # Looked up in the user data folder first (Settings → Import cookies), then next to the app.
@@ -109,12 +111,25 @@ def wipe_temp():
         roots = {j.get('root_id') for j in jobs.values() if j.get('root_id')}
     for r in roots:
         _delete_lineage(r)
+    with _inflight_lock:
+        roots_inflight = list(_inflight)
+    for r in roots_inflight:
+        _cancel_inflight(r)
     with jobs_lock:
-        for jid in [k for k, j in jobs.items() if j.get('kind') == 'upload']:
-            shutil.rmtree(jobs.pop(jid).get('tmp', ''), ignore_errors=True)
+        ups = [jobs.pop(k) for k, j in list(jobs.items()) if j.get('kind') == 'upload']
+    for up in ups:
+        if up.get('tmp'):                                # picked files (external) are never touched
+            shutil.rmtree(up['tmp'], ignore_errors=True)
     if TEMP_ROOT and os.path.isdir(TEMP_ROOT):
         for name in os.listdir(TEMP_ROOT):
-            shutil.rmtree(os.path.join(TEMP_ROOT, name), ignore_errors=True)
+            p = os.path.join(TEMP_ROOT, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                try:
+                    os.remove(p)                         # leftover upload spool files
+                except OSError:
+                    pass
 
 
 def temp_usage_mb():
@@ -124,14 +139,19 @@ def temp_usage_mb():
             dirs = [j['tmp'] for j in jobs.values() if j.get('tmp')]
     else:
         dirs = [base]
-    total = 0
+    total, seen = 0, set()
     for d in dirs:
         for root, _, files in os.walk(d):
             for f in files:
                 try:
-                    total += os.path.getsize(os.path.join(root, f))
+                    s = os.stat(os.path.join(root, f))
                 except OSError:
-                    pass
+                    continue
+                ident = (s.st_dev, s.st_ino)
+                if s.st_ino and ident in seen:       # hard links (shared uploads) count once
+                    continue
+                seen.add(ident)
+                total += s.st_size
     return round(total / 1e6, 1)
 
 
@@ -236,9 +256,9 @@ def _new_job(kind, root_id=None, state=None):
         jobs[jid] = {
             'kind': kind, 'status': 'pending', 'queue': queue.Queue(),
             'created_at': now, 'touched_at': now,
-            'root_id': root_id or jid, 'tmp': None, 'state': state,
+            'root_id': root_id or jid, 'tmp': None, 'out_dir': None, 'state': state,
             'file_mp4': None, 'file_preview': None, 'file_synced_mp3': None,
-            'cancel': threading.Event(), 'procs': [],
+            'cancel': threading.Event(), 'procs': [], 'pct': 0,
         }
     return jid
 
@@ -251,6 +271,12 @@ def _push(job_id, msg):
 
 
 def _step(job_id, msg, pct):
+    # Never move the bar backwards (video and song are prepared at the same time).
+    with jobs_lock:
+        j = jobs.get(job_id)
+        if j is not None:
+            pct = max(int(pct), j.get('pct', 0))
+            j['pct'] = pct
     _push(job_id, {'type': 'progress', 'msg': msg, 'pct': int(pct)})
 
 
@@ -272,13 +298,17 @@ def _check_cancel(job_id):
         raise Cancelled()
 
 
-def _cancel_job(j):
-    j['cancel'].set()
+def _kill_procs(j):
     for p in list(j.get('procs', [])):
         try:
             p.kill()
         except Exception:
             pass
+
+
+def _cancel_job(j):
+    j['cancel'].set()
+    _kill_procs(j)
 
 
 def _cancel_lineage(root_id, except_id=None):
@@ -297,7 +327,44 @@ def _delete_lineage(root_id):
     for j in victims:
         _cancel_job(j)
         if j.get('tmp'):
+            _cancel_inflight(j['tmp'])                   # the session's background export encode
+    for j in victims:
+        if j.get('tmp'):
             shutil.rmtree(j['tmp'], ignore_errors=True)
+
+
+def _prune(job_id, keep_last_done):
+    """Free disk space: delete the render files of older adjustments in this session. Before, every
+    nudge left a full-size export behind until the session expired (tens of GB with 4K video).
+    Keeps the source/analysis files, any job still running and — until this job is done — the
+    last finished one, whose downloads stay valid if this change fails."""
+    with jobs_lock:
+        me = jobs.get(job_id)
+        if not me:
+            return
+        root = me['root_id']
+        others = [(jid, j) for jid, j in jobs.items() if j.get('root_id') == root and jid != job_id]
+        last_done = None
+        if keep_last_done:
+            done = [(j['created_at'], jid) for jid, j in others if j.get('status') == 'done' and j.get('out_dir')]
+            last_done = max(done)[1] if done else None
+        dirs = []
+        for jid, j in others:
+            if jid == last_done or not j.get('out_dir') or j.get('status') in ('pending', 'running', 'preview'):
+                continue
+            dirs.append(j['out_dir'])
+            j.update(out_dir=None, file_mp4=None, file_preview=None, file_synced_mp3=None, synced_wav=None)
+            if jid != root:
+                j['tmp'] = None
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _prune_later(job_id, keep_last_done, delay=5.0):
+    # A short delay lets the page switch to the new preview before the old file disappears.
+    t = threading.Timer(delay, _prune, args=(job_id, keep_last_done))
+    t.daemon = True
+    t.start()
 
 
 def _cleanup_loop():
@@ -308,12 +375,14 @@ def _cleanup_loop():
         with jobs_lock:
             for jid, j in jobs.items():
                 if j.get('kind') == 'upload':
-                    if now - j['created_at'] > JOB_TTL_SEC:
+                    if now - j['created_at'] > JOB_TTL_SEC and not j.get('pinned') and not j.get('external'):
                         stale_uploads.append(jid)
                 elif j.get('root_id') == jid and now - j.get('touched_at', now) > JOB_TTL_SEC:
                     stale_roots.append(jid)
-            for jid in stale_uploads:
-                shutil.rmtree(jobs.pop(jid).get('tmp', ''), ignore_errors=True)
+            ups = [jobs.pop(jid) for jid in stale_uploads]
+        for up in ups:
+            if up.get('tmp'):
+                shutil.rmtree(up['tmp'], ignore_errors=True)
         # Spool files of uploads that were aborted half-way
         spool_dir = TEMP_ROOT or tempfile.gettempdir()
         try:
@@ -353,24 +422,29 @@ def _friendly(err):
 # Encoders run one step below normal priority: they still get every idle CPU
 # cycle (same speed), but the rest of the PC stays responsive during long renders.
 if os.name == 'nt':
-    _LOW_PRIO = {'creationflags': getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)}
+    # CREATE_NO_WINDOW must be included: passing any creationflags switches off the desktop
+    # app's console-hiding default, and every ffmpeg run would flash a cmd window.
+    _LOW_PRIO = {'creationflags': getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)
+                                  | getattr(subprocess, 'CREATE_NO_WINDOW', 0)}
     _NICE = []
 else:
     _LOW_PRIO = {}
     _NICE = ['nice', '-n', '5'] if shutil.which('nice') else []
 
 
-def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
+def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None, holder=None, on_progress=None):
+    """holder: a list the process is added to while it runs (so a shared background encode can be
+    stopped); on_progress(frac): progress callback for encodes not tied to one job."""
     if timeout is None:
         # Long, heavy sources on the "high" preset can take several times real time;
         # a fixed 1 h limit used to kill those exports. Cancel still works at any time.
         timeout = max(4 * 3600, (dur or 0) * 40)
     cmd = _NICE + ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostats', '-y']
-    if job_id and dur:
+    if dur:
         cmd += ['-progress', 'pipe:1']
     cmd += args
     with tempfile.TemporaryFile(mode='w+') as errf:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if (job_id and dur) else subprocess.DEVNULL,
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if dur else subprocess.DEVNULL,
                                 stderr=errf, text=True, **_LOW_PRIO)
         j = None
         if job_id:
@@ -378,6 +452,8 @@ def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
                 j = jobs.get(job_id)
                 if j is not None:
                     j['procs'].append(proc)
+        if holder is not None:
+            holder.append(proc)
         killer = threading.Timer(timeout, proc.kill)
         killer.start()
         try:
@@ -386,7 +462,7 @@ def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
             if proc.stdout is not None:
                 last = 0.0
                 for line in proc.stdout:
-                    if line.startswith('out_time_us=') and dur and p0 is not None:
+                    if line.startswith('out_time_us=') and dur:
                         try:
                             sec = int(line.split('=')[1]) / 1e6
                         except ValueError:
@@ -395,7 +471,10 @@ def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
                         if now - last > 0.4:
                             last = now
                             frac = max(0.0, min(1.0, sec / dur))
-                            _step(job_id, f'{label} {int(frac * 100)}%', p0 + (p1 - p0) * frac)
+                            if on_progress:
+                                on_progress(frac)
+                            if job_id and p0 is not None:
+                                _step(job_id, f'{label} {int(frac * 100)}%', p0 + (p1 - p0) * frac)
             proc.wait()
         finally:
             killer.cancel()
@@ -403,6 +482,8 @@ def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
                 with jobs_lock:
                     if proc in j['procs']:
                         j['procs'].remove(proc)
+            if holder is not None and proc in holder:
+                holder.remove(proc)
         if j is not None and j['cancel'].is_set():
             raise Cancelled()
         if proc.returncode != 0:
@@ -414,7 +495,7 @@ def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
 def _probe_video(path):
     r = subprocess.run(
         ['ffprobe', '-v', 'error', '-show_entries',
-         'stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate:'
+         'stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate:stream_disposition=attached_pic:'
          'stream_side_data=rotation:stream_tags=rotate:format=duration',
          '-of', 'json', path],
         capture_output=True, text=True, timeout=30)
@@ -423,7 +504,9 @@ def _probe_video(path):
     except json.JSONDecodeError:
         info = {}
     streams = info.get('streams', [])
-    v = next((s for s in streams if s.get('codec_type') == 'video'), None)
+    # Cover art / thumbnails show up as one-frame "video" streams — skip them.
+    v = next((s for s in streams if s.get('codec_type') == 'video'
+              and not (s.get('disposition') or {}).get('attached_pic')), None)
     if not v:
         raise RuntimeError('No video stream found in the video source.')
     w, h = int(v.get('width') or 0), int(v.get('height') or 0)
@@ -583,20 +666,46 @@ def _dl_video(url, tmp, name, job_id=None, p0=0, p1=0):
     return str(files[0])
 
 
-def _link_or_copy(src, dst):
-    """Hard-link when possible (instant, no extra disk for multi-GB uploads), else copy."""
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
-
-
-def _upload_path(file_id):
+def _upload_entry(file_id):
     with jobs_lock:
         up = jobs.get(file_id)
     if not up or up.get('kind') != 'upload':
         raise RuntimeError('Uploaded file expired — please upload it again.')
-    return up['path'], up['ext']
+    return up
+
+
+def _use_upload(file_id, tmp, name):
+    """The session's handle on an uploaded or picked file — never a full copy. Files picked in
+    the desktop dialog are read where they are; uploads are hard-linked into the session folder."""
+    up = _upload_entry(file_id)
+    src, ext = up['path'], up['ext']
+    if not os.path.isfile(src):
+        raise RuntimeError(f'The file is no longer there: {src}')
+    if up.get('external'):
+        return src, ext
+    dest = os.path.join(tmp, name + ext)
+    try:
+        os.link(src, dest)
+        return dest, ext
+    except OSError:
+        with jobs_lock:
+            up['pinned'] = True                  # read it in place and keep it until the app closes
+        return src, ext
+
+
+def register_local(path):
+    """Desktop: use a file chosen in the native Open dialog where it is (no upload, no copy)."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext not in ALLOWED_VIDEO | ALLOWED_AUDIO:
+        raise ValueError(f'Unsupported file type: {ext or "unknown"}')
+    if not p.is_file():
+        raise ValueError('File not found.')
+    file_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[file_id] = {'kind': 'upload', 'path': str(p), 'tmp': None, 'ext': ext,
+                         'created_at': time.time(), 'external': True}
+    return {'file_id': file_id, 'name': p.name, 'ext': ext, 'size': p.stat().st_size}
 
 
 def _trim_args(start, end):
@@ -606,6 +715,22 @@ def _trim_args(start, end):
     if end is not None:
         a += ['-t', f'{max(0.1, float(end) - float(start or 0)):.3f}']
     return a
+
+
+def _trim_in(trim):
+    """Input options that cut the source to [start, start+dur). With re-encoding ffmpeg seeks
+    frame- and sample-accurately, so no trimmed copy of the video is needed."""
+    a = []
+    if trim:
+        if trim[0] > 0:
+            a += ['-ss', f'{trim[0]:.3f}']
+        if trim[1]:
+            a += ['-t', f'{trim[1]:.3f}']
+    return a
+
+
+def _vid_in(st):
+    return _trim_in(st.get('vid_trim')) + ['-i', st['vid_file']]
 
 
 def _stream_info(path):
@@ -646,42 +771,48 @@ def _audio_as_video(job_id, src, tmp, trim_start, trim_end):
 
 def _prepare_video(job_id, url, file_id, tmp, trim_start, trim_end):
     if file_id:
-        src, ext = _upload_path(file_id)
-        vid = os.path.join(tmp, f'vid{ext}')
-        _link_or_copy(src, vid)
+        vid, _ext = _use_upload(file_id, tmp, 'vid')
     else:
         vid = _dl_video(url, tmp, 'vid', job_id, 3, 9)
 
+    trim = None
     if not _stream_info(vid)[0]:
-        vid = _audio_as_video(job_id, vid, tmp, trim_start, trim_end)
-    elif trim_start is not None or trim_end is not None:
-        # Frame-accurate trim (stream-copy would snap to the previous keyframe
-        # and silently shift the beat grid).
-        _step(job_id, 'Trimming video (frame-accurate)...', 9)
-        trimmed = os.path.join(tmp, 'vid_trimmed.mp4')
-        start = trim_start or 0.0
-        t_dur = (trim_end - start) if trim_end is not None else max(0.1, _probe_video(vid)['dur'] - start)
-        _ffmpeg(job_id, _trim_args(trim_start, trim_end)[:2] + ['-i', vid] + _trim_args(trim_start, trim_end)[2:] +
-                ['-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-crf', '17', '-preset', 'veryfast',
-                 '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', trimmed],
-                dur=t_dur, p0=9, p1=11, label='Trimming video')
-        vid = trimmed
-
-    info = _probe_video(vid)
+        vid = _audio_as_video(job_id, vid, tmp, trim_start, trim_end)    # trim applied in the same pass
+        info = _probe_video(vid)
+        info['audio_only'] = True
+    else:
+        info = _probe_video(vid)
+        # The trim is applied when reading (frame-accurate). It used to re-encode the whole clip
+        # up front: a full encode before analysis even started, plus a second generation of loss.
+        if trim_start is not None or trim_end is not None:
+            full = info['dur']
+            ss = float(trim_start or 0.0)
+            end = float(trim_end) if trim_end is not None else None
+            if full > 0:
+                if ss >= full - 0.05:
+                    raise RuntimeError('Video trim start is past the end of the video.')
+                if end is not None:
+                    end = min(end, full)
+            if end is not None:
+                d = max(0.1, end - ss)
+            else:
+                d = (full - ss) if full > 0 else None
+            if ss > 0 or d:
+                trim = [round(ss, 3), round(d, 3) if d else None]
+                if d:
+                    info['dur'] = round(d, 3)
     if not info['has_audio']:
         raise RuntimeError('The video has no audio track, so its beat cannot be detected.')
     audio = os.path.join(tmp, 'vid_audio.wav')
     # Analyse the audio that is actually inside the video file (not a second download).
-    _ffmpeg(job_id, ['-i', vid, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '22050',
-                     '-acodec', 'pcm_s16le', audio])
-    return vid, audio, info
+    _ffmpeg(job_id, _trim_in(trim) + ['-i', vid, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '22050',
+                                      '-acodec', 'pcm_s16le', audio])
+    return vid, audio, info, trim
 
 
 def _prepare_song(job_id, url, file_id, tmp, trim_start, trim_end):
     if file_id:
-        src, ext = _upload_path(file_id)
-        raw = os.path.join(tmp, f'song_src{ext}')
-        _link_or_copy(src, raw)
+        raw, _ext = _use_upload(file_id, tmp, 'song_src')
     else:
         raw = _dl_audio(url, tmp, 'song_src', job_id, 12, 18)
     wav = os.path.join(tmp, 'song.wav')
@@ -703,16 +834,57 @@ CHUNK_SEC = 60.0             # long files are analysed in chunks of this size (f
 
 
 def _refine_bpm(beat_times):
+    """Tempo from a line through beat number vs beat time. The beat number counts beats the
+    tracker skipped (noise, breaks); the old mean of the gaps counted a skipped beat as one long
+    gap, which pulled the tempo down (1.4% on a noisy test video = seconds of drift)."""
     import numpy as np
-    bt = np.atleast_1d(beat_times)
+    bt = np.atleast_1d(np.asarray(beat_times, dtype=float))
     if len(bt) < 4:
         return None
-    intervals = np.diff(bt)
-    med = float(np.median(intervals))
-    clean = intervals[(intervals > med * 0.5) & (intervals < med * 2.0)]
-    if len(clean) < 2:
+    d = np.diff(bt)
+    med = float(np.median(d))
+    if med <= 0:
         return None
-    return round(60.0 / float(np.mean(clean)), 4)
+    k = np.concatenate([[0], np.cumsum(np.maximum(1, np.round(d / med)))])
+    slope, icpt = np.polyfit(k, bt, 1)
+    good = np.abs(bt - (slope * k + icpt)) < 0.25 * med
+    if good.sum() >= 4:
+        slope, icpt = np.polyfit(k[good], bt[good], 1)
+    if not 0.5 * med < slope < 1.5 * med:
+        return None
+    return round(60.0 / float(slope), 4)
+
+
+def _median_along(S, size, axis):
+    """scipy.ndimage.median_filter(S, size along `axis` only, mode='reflect'), run as one 1-D
+    filter per row. Same numbers, but SciPy's 1-D median (SciPy >= 1.15) is ~10x faster than
+    its N-D one."""
+    import numpy as np
+    from scipy.ndimage import median_filter
+    A = np.moveaxis(S, axis, -1)
+    out = np.empty(A.shape, dtype=S.dtype)
+    for i in range(A.shape[0]):
+        out[i] = median_filter(A[i], size=size, mode='reflect')
+    return np.moveaxis(out, -1, axis)
+
+
+def _hpss_percussive(y, margin=3.0, kernel=31):
+    """Percussive part of librosa.effects.hpss(y, margin=margin) — identical output, ~5x faster:
+    skips the unused harmonic resynthesis and uses the fast median filter."""
+    import librosa
+    try:
+        stft = librosa.stft(y, n_fft=2048, hop_length=None, win_length=None, window='hann',
+                            center=True, pad_mode='constant')
+        S, phase = librosa.magphase(stft)
+        del stft
+        harm = _median_along(S, kernel, axis=-1)
+        perc = _median_along(S, kernel, axis=-2)
+        mask = librosa.util.softmask(perc, harm * margin, power=2.0, split_zeros=False)
+        del harm, perc
+        return librosa.istft((S * mask) * phase, dtype=y.dtype, n_fft=2048, hop_length=None,
+                             win_length=None, center=True, length=y.shape[-1])
+    except Exception:                                   # unexpected librosa API change → reference path
+        return librosa.effects.hpss(y, margin=margin)[1]
 
 
 def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
@@ -745,7 +917,7 @@ def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
         D = np.abs(librosa.stft(seg, n_fft=N_FFT, hop_length=hop))[:, f0:f1]
         mel.append(mel_basis @ (D ** 2))
         low_mag.append(D[low])
-        y_perc = librosa.effects.hpss(seg, margin=3.0)[1]
+        y_perc = _hpss_percussive(seg, margin=3.0)
         P = np.abs(librosa.stft(y_perc, n_fft=N_FFT, hop_length=hop))[:, f0:f1]
         mel_perc.append(mel_basis @ (P ** 2))
         del D, P, y_perc
@@ -1046,12 +1218,15 @@ def _kick_attacks(y, sr, fc=180.0, chunk_sec=CHUNK_SEC):
     return (pk + lag / 2) * hop / sr + 0.0063, rise[pk]
 
 
-def _precise_period(y, sr, period, span=0.012, min_conc=0.4):
+def _precise_period(y, sr, period, span=0.02, min_conc=0.4, min_prominence=8.0):
     """
     Refine a beat period to sub-millisecond precision: the period at which the
     kick attacks line up best (circular concentration), searched within ±span.
     Precision grows with the length of the track, which is what long videos need.
     Returns None when there is no clear kick pulse (then the tracker's tempo stays).
+    The pulse strength counts the beat and the half-beat (off-beat bass / hats used to cancel
+    the kicks and hide a clear pulse), and a peak is accepted when it stands far above the
+    noise floor of the search range, not only above a fixed level.
     """
     import numpy as np
     t, w = _kick_attacks(y, sr)
@@ -1067,9 +1242,11 @@ def _precise_period(y, sr, period, span=0.012, min_conc=0.4):
     conc = np.empty(len(grid))
     for i in range(0, len(grid), 256):            # bounded memory for very long tracks
         g = grid[i:i + 256]
-        conc[i:i + len(g)] = np.abs(np.exp(2j * np.pi * t[None, :] / g[:, None]) @ w) / w.sum()
+        ph = np.exp(2j * np.pi * t[None, :] / g[:, None])
+        conc[i:i + len(g)] = (np.abs(ph @ w) + np.abs((ph * ph) @ w)) / (2 * w.sum())
     k = int(np.argmax(conc))
-    if conc[k] < min_conc or k == 0 or k == len(grid) - 1:
+    clear = conc[k] >= min_conc or conc[k] >= min_prominence * float(np.median(conc))
+    if not clear or k == 0 or k == len(grid) - 1:
         return None
     p = float(grid[k])
     # Off-beat hits (hats, bass) bias the concentration peak slightly, so finish
@@ -1327,6 +1504,9 @@ def _beat_effects(o, W, H, period, phase):
     return out
 
 
+_TEXTURE_FX = {'glitch', 'scanlines'}
+
+
 def _build_vf(st, o, out_dur, preview):
     vi = st['vid_info']
     W, H = _even(vi['w']), _even(vi['h'])
@@ -1350,31 +1530,42 @@ def _build_vf(st, o, out_dur, preview):
         if (nw, nh) != (W, H):
             parts.append(f'crop={nw}:{nh}')
             W, H = nw, nh
+    f = o['filters']
+    # Preview of a big (1080p/4K) video: shrink to 720p *before* the colour work and effects, so
+    # they run on ~4-9x fewer pixels. Skipped when a filter's look depends on pixel size (grain,
+    # sharpen, denoise, scanlines, glitch noise), so the preview still shows what the export does.
+    texture = (f['denoise'] > 0.01 or f['sharpness'] > 0.02 or f['grain'] > 0.01
+               or bool(_TEXTURE_FX & set(o['effects'])))
+    early = preview and H > 720 and not texture
+    if early:
+        W, H = _even(W * 720.0 / H), 720
+        parts.append(f'scale={W}:{H}')
     if o['hflip']:
         parts.append('hflip')
-    parts += _color_filters(o['filters'])
-    if preview and H > 720:
-        # Downscale BEFORE the beat effects: per-frame zoom / rotate / blur on
-        # 4K frames made previews of heavy videos crawl. Effect sizes scale with W/H.
-        W, H = _even(W * 720 / H), 720
-        parts.append(f'scale={W}:{H}')
-    period, phase = _trigger(st, o['fx_division'])
-    parts += _beat_effects(o, W, H, period, phase)
-    parts += _overlay_filters(o['filters'])
+    parts += _color_filters(f)
+    if o['effects']:
+        period, phase = _trigger(st, o['fx_division'])
+        parts += _beat_effects(o, W, H, period, phase)
+    parts += _overlay_filters(f)
     fo = o['fade_out']
     if fo > 0 and out_dur > fo * 1.5 and (not preview or o['preview_sec'] <= 0 or o['preview_sec'] >= out_dur):
         parts.append(f'fade=t=out:st={out_dur - fo:.3f}:d={fo:.3f}')
+    if preview and H > 720:
+        parts.append('scale=-2:720')
     if parts or preview:
         parts.append('format=yuv420p')
     return ','.join(parts) if parts else None
 
 
-def _audio_graph(st, o, out_dur, fade_ok=True):
-    """Returns (filter_complex_parts, amap). Input 0 = video, input 1 = song wav."""
-    vi = st['vid_info']
+def _mixing(st, o):
+    return (1.0 - o['song_vol']) > 0.01 and bool(st['vid_info'].get('has_audio'))
+
+
+def _audio_graph(st, o, out_dur, fade_ok=True, orig='0:a:0', song='1:a:0'):
+    """Returns (filter_complex_parts, amap). `orig` = the video's own audio, `song` = synced wav."""
     new_vol = o['song_vol']
     orig_vol = 1.0 - new_vol
-    mixing = orig_vol > 0.01 and vi.get('has_audio')
+    mixing = _mixing(st, o)
     fo = o['fade_out']
     tail = f',afade=t=out:st={out_dur - fo:.3f}:d={fo:.3f}' if (fade_ok and fo > 0 and out_dur > fo * 1.5) else ''
     if mixing:
@@ -1382,12 +1573,12 @@ def _audio_graph(st, o, out_dur, fade_ok=True):
         vs = st.get('video_speed') or 1.0
         at = (_build_atempo(vs) + ',') if abs(vs - 1.0) > 1e-3 else ''   # keep original audio in sync with sped video
         norm = ':normalize=0' if CAPS['amix_normalize'] else ''
-        return ([f'[0:a:0]{at}aformat=channel_layouts=stereo,volume={orig_vol * k:.4f}[oa]',
-                 f'[1:a:0]aformat=channel_layouts=stereo,volume={new_vol * k:.4f}[na]',
+        return ([f'[{orig}]{at}aformat=channel_layouts=stereo,volume={orig_vol * k:.4f}[oa]',
+                 f'[{song}]aformat=channel_layouts=stereo,volume={new_vol * k:.4f}[na]',
                  f'[oa][na]amix=inputs=2:duration=longest{norm}{tail}[a]'], '[a]')
     if abs(new_vol - 1.0) > 0.004 or tail:
-        return [f'[1:a:0]volume={new_vol:.4f}{tail}[a]'], '[a]'
-    return [], '1:a:0'
+        return [f'[{song}]volume={new_vol:.4f}{tail}[a]'], '[a]'
+    return [], song
 
 
 def _build_atempo(speed):
@@ -1402,30 +1593,239 @@ def _build_atempo(speed):
     return ','.join(filters)
 
 
-def _mux(job_id, st, wav, out_path, out_dur, preview, p0, p1, label):
-    o = st['opts']
-    t_lim = out_dur
+# ─────────────────────────────────────────────────────────────────────────────
+# Video track cache
+#
+# The picture of a render depends only on the look (filters, effects, aspect, speed, trim,
+# quality) — not on where the song sits. So each look is encoded once per session, video only,
+# and cached; then the synced audio is muxed on (seconds, stream copy). Timing nudges, pitch and
+# mix changes no longer re-encode the whole video. Beat effects follow the offset, so with an
+# effect on, a nudge still re-encodes the picture (as it must).
+#
+# The export encode belongs to the session, not to one adjustment: it starts in the background
+# (low priority) while the preview renders, and a new adjustment with the same look simply joins
+# it instead of killing it and starting over.
+# ─────────────────────────────────────────────────────────────────────────────
+
+VCACHE_KEEP = {'p': 12, 'e': 2}          # cached looks kept per session (previews / full exports)
+COPY_CODECS = {'h264': [], 'hevc': ['-tag:v', 'hvc1']}
+_inflight = {}                           # session root dir -> {key: _Encode}
+_inflight_lock = threading.Lock()
+
+
+def _t_lim(o, out_dur, preview):
     if preview and o['preview_sec'] > 0:
-        t_lim = min(out_dur, float(o['preview_sec']))
+        return min(out_dur, float(o['preview_sec']))
+    return out_dur
+
+
+def _copy_args(st, vf):
+    """Stream copy when the picture can go into the MP4 untouched: instant and lossless.
+    (H.265/HEVC too now — it used to be re-encoded to H.264 even with nothing changed.)"""
+    codec = st['vid_info']['codec']
+    if vf is None and not st.get('vid_trim') and codec in COPY_CODECS:
+        return ['-c:v', 'copy'] + COPY_CODECS[codec]
+    return None
+
+
+def _venc_args(o, vf, preview):
+    if preview:
+        return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26']
+    if vf is None:
+        # Picture unchanged; re-encoded only for a trim (or a codec MP4 can't hold). Visually
+        # lossless, exactly like the old frame-accurate trim — but now it is the only encode.
+        preset = QUALITY['high'][0] if o['quality'] == 'high' else 'veryfast'
+        return ['-c:v', 'libx264', '-preset', preset, '-crf', '17', '-pix_fmt', 'yuv420p']
+    preset, crf = QUALITY[o['quality']]
+    return ['-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-pix_fmt', 'yuv420p']
+
+
+def _track_spec(st, o, out_dur, preview):
     vf = _build_vf(st, o, out_dur, preview)
-    fc, amap = _audio_graph(st, o, out_dur, fade_ok=(t_lim >= out_dur - 0.01))
-    vmap = '0:v:0'
+    t = _t_lim(o, out_dur, preview)
+    enc = _venc_args(o, vf, preview)
+    key = hashlib.sha1(json.dumps([st['vid_file'], st.get('vid_trim'), vf, enc, round(t, 3), preview])
+                       .encode('utf-8')).hexdigest()[:20]
+    path = os.path.join(st['root_tmp'], 'vcache', ('p_' if preview else 'e_') + key + '.mp4')
+    return vf, t, enc, path
+
+
+def _track_args(st, vf, t, enc, out):
+    args = _vid_in(st)
     if vf:
-        fc = [f'[0:v:0]{vf}[v]'] + fc
-        vmap = '[v]'
-    args = ['-i', st['vid_file'], '-i', wav]
+        args += ['-filter_complex', f'[0:v:0]{vf}[v]', '-map', '[v]']
+    else:
+        args += ['-map', '0:v:0']
+    return args + ['-an', '-t', f'{t:.3f}'] + enc + [out]
+
+
+def _evict(path, kind):
+    """Keep only the newest few cached looks of this kind."""
+    d = os.path.dirname(path)
+    try:
+        files = [os.path.join(d, n) for n in os.listdir(d) if n.startswith(kind + '_') and n.endswith('.mp4')
+                 and '.part' not in n]
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except OSError:
+        return
+    for old in files[VCACHE_KEEP[kind]:]:
+        if old != path:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+
+def _reuse(path):
+    if os.path.exists(path):
+        try:
+            os.utime(path)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _preview_track(job_id, st, o, out_dur, p0, p1):
+    vf, t, enc, path = _track_spec(st, o, out_dur, True)
+    if _reuse(path):
+        return path, t
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    part = f'{path}.{job_id[:8]}.part.mp4'
+    try:
+        _ffmpeg(job_id, _track_args(st, vf, t, enc, part), dur=t, p0=p0, p1=p1, label='Rendering preview')
+        os.replace(part, path)
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    _evict(path, 'p')
+    return path, t
+
+
+class _Encode:
+    def __init__(self, path):
+        self.path = path
+        self.done = threading.Event()
+        self.error = None
+        self.cancelled = False
+        self.procs = []
+        self.frac = 0.0
+
+    def cancel(self):
+        self.cancelled = True
+        for p in list(self.procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def _cancel_inflight(root_tmp):
+    with _inflight_lock:
+        sess = _inflight.pop(root_tmp, {})
+    for e in sess.values():
+        e.cancel()
+
+
+def _export_track(st, o, out_dur):
+    """Start (or join) the session's encode of the export picture for this look.
+    Returns an _Encode (already finished if cached), or None when the source can be stream-copied."""
+    vf, t, enc, path = _track_spec(st, o, out_dur, False)
+    if _copy_args(st, vf) is not None:
+        return None
+    root = st['root_tmp']
+    with _inflight_lock:
+        sess = _inflight.setdefault(root, {})
+        e = sess.get(path)
+        if e is not None and not e.cancelled:
+            return e
+        if _reuse(path):
+            e = _Encode(path)
+            e.done.set()
+            return e
+        for other in sess.values():              # a different look replaces any unfinished encode
+            other.cancel()
+        e = _Encode(path)
+        sess[path] = e
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def work():
+        part = f'{path}.part.mp4'
+        try:
+            _ffmpeg(None, _track_args(st, vf, t, enc, part), dur=t, holder=e.procs, on_progress=lambda f: setattr(e, 'frac', f))
+            if e.cancelled:
+                raise Cancelled()
+            os.replace(part, path)
+            _evict(path, 'e')
+        except BaseException as ex:
+            e.error = Cancelled() if e.cancelled else ex
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        finally:
+            with _inflight_lock:
+                if _inflight.get(root, {}).get(path) is e:
+                    del _inflight[root][path]
+            e.done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    return e
+
+
+def _wait_export(job_id, st, o, out_dur, e, p0, p1):
+    """Wait for the export picture (forwarding its progress). Restarts it if it was interrupted
+    while this adjustment still wants it."""
+    for _ in range(3):
+        while not e.done.wait(0.4):
+            _check_cancel(job_id)
+            _step(job_id, f'Exporting video {int(e.frac * 100)}%', p0 + (p1 - p0) * e.frac)
+        _check_cancel(job_id)
+        if e.error is None:
+            return e.path
+        if not isinstance(e.error, Cancelled):
+            raise e.error
+        e = _export_track(st, o, out_dur)
+    raise RuntimeError('Export was interrupted — make another change to retry.')
+
+
+_orig_audio_locks = collections.defaultdict(threading.Lock)
+
+
+def _orig_audio_in(job_id, st, full):
+    """Input args for the video's own audio (for the mix). For a full-length mux it is decoded once
+    per session to a lossless float WAV, so a big video file isn't read again on every export."""
+    if not full:
+        return _vid_in(st)                       # previews read only their first seconds anyway
+    path = os.path.join(st['root_tmp'], 'orig_audio.wav')
+    with _orig_audio_locks[path]:
+        if not os.path.exists(path):
+            part = path + '.part.wav'
+            _ffmpeg(job_id, _vid_in(st) + ['-map', '0:a:0', '-vn', '-c:a', 'pcm_f32le', part])
+            os.replace(part, path)
+    return ['-i', path]
+
+
+def _mux_final(job_id, st, o, vtrack, wav, out_path, out_dur, t_lim, preview, p0, p1, label):
+    """Picture (a cached track, or the source itself when stream-copying) + synced soundtrack → MP4."""
+    if vtrack:
+        args = ['-i', vtrack, '-i', wav]
+        vcodec = ['-c:v', 'copy']
+        orig = '2:a:0'
+        if _mixing(st, o):
+            args += _orig_audio_in(job_id, st, full=not preview)   # the video's own audio, for the mix
+    else:
+        args = _vid_in(st) + ['-i', wav]
+        vcodec = _copy_args(st, None)
+        orig = '0:a:0'
+    fc, amap = _audio_graph(st, o, out_dur, fade_ok=(t_lim >= out_dur - 0.01), orig=orig, song='1:a:0')
     if fc:
         args += ['-filter_complex', ';'.join(fc)]
-    args += ['-map', vmap, '-map', amap, '-t', f'{t_lim:.3f}']
-    if preview:
-        args += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-c:a', 'aac', '-b:a', '160k']
-    elif vf is None and st['vid_info']['codec'] == 'h264':
-        args += ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k']
-    else:
-        preset, crf = QUALITY[o['quality']]
-        args += ['-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-pix_fmt', 'yuv420p',
-                 '-c:a', 'aac', '-b:a', '256k']
-    args += ['-movflags', '+faststart', out_path]
+    args += ['-map', '0:v:0', '-map', amap, '-t', f'{t_lim:.3f}'] + vcodec
+    args += ['-c:a', 'aac', '-b:a', '160k' if preview else '256k', '-movflags', '+faststart', out_path]
     _ffmpeg(job_id, args, dur=t_lim, p0=p0, p1=p1, label=label)
 
 
@@ -1453,14 +1853,33 @@ def _slice_audio(st, out_wav):
     return min(vid_out_dur, len(data) / sr)
 
 
+_full_mp3_locks = collections.defaultdict(threading.Lock)
+
+
 def _ensure_full_mp3(job_id, st):
-    """Full song, BPM-matched, in the current pitch mode (cached in the session root dir)."""
-    import numpy as np
-    import soundfile as sf
+    """Full song, BPM-matched, in the current pitch mode (cached in the session root dir).
+    No longer built before every export: it is made in the background after the export, or on
+    demand when downloaded."""
     key = 'preserve' if st['preserve_pitch'] else 'resample'
     path = os.path.join(st['root_tmp'], f'full_song_{key}.mp3')
-    if os.path.exists(path):
-        return path
+    with _full_mp3_locks[path]:
+        if os.path.exists(path):
+            return path
+        return _build_full_mp3(job_id, st, key, path)
+
+
+def _full_mp3_later(st):
+    def work():
+        try:
+            _ensure_full_mp3(None, st)
+        except Exception:
+            pass                                 # retried on download
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _build_full_mp3(job_id, st, key, path):
+    import numpy as np
+    import soundfile as sf
     src = st['full_preserve_wav'] if st['preserve_pitch'] else st['full_resample_wav']
     if st['bpm_mode'] == 'song' and abs(st['mp3_stretch'] - 1.0) > 1e-3:
         import librosa
@@ -1480,9 +1899,10 @@ def _ensure_full_mp3(job_id, st):
     return path
 
 
-def _render(job_id, st, tmp, p_start=5):
+def _render(job_id, st, out_dir, p_start=5):
     _check_cancel(job_id)
-    out_wav = os.path.join(tmp, 'synced.wav')
+    o = st['opts']
+    out_wav = os.path.join(out_dir, 'synced.wav')
     out_dur = _slice_audio(st, out_wav)
     if out_dur < 0.5:
         raise RuntimeError('Not enough song left after this offset — nudge back or reset.')
@@ -1490,27 +1910,36 @@ def _render(job_id, st, tmp, p_start=5):
     timing['out_dur'] = round(out_dur, 3)
     _push(job_id, dict(type='timing', **timing))
 
+    # The full export picture starts right away in the background (or is already cached / running).
+    export = _export_track(st, o, out_dur)
+
     span = 100 - p_start
     p_prev_end = p_start + span * 0.25
-    preview = os.path.join(tmp, 'preview.mp4')
-    _mux(job_id, st, out_wav, preview, out_dur, True, p_start, p_prev_end, 'Rendering preview')
+    vtrack, t_prev = _preview_track(job_id, st, o, out_dur, p_start, p_prev_end - 2)
+    preview = os.path.join(out_dir, 'preview.mp4')
+    _mux_final(job_id, st, o, vtrack, out_wav, preview, out_dur, t_prev, True,
+               p_prev_end - 2, p_prev_end, 'Finishing preview')
     with jobs_lock:
         jobs[job_id]['file_preview'] = preview
         jobs[job_id]['status'] = 'preview'
     _push(job_id, {'type': 'preview_ready'})
+    _prune_later(job_id, keep_last_done=True)
 
     _check_cancel(job_id)
-    _step(job_id, 'Preparing full-song MP3...', p_prev_end + 2)
-    mp3 = _ensure_full_mp3(job_id, st)
-
-    out_mp4 = os.path.join(tmp, 'syncedVid.mp4')
-    _mux(job_id, st, out_wav, out_mp4, out_dur, False, p_prev_end + 5, 99, 'Exporting video')
+    out_mp4 = os.path.join(out_dir, 'syncedVid.mp4')
+    if export is not None:
+        vtrack_e = _wait_export(job_id, st, o, out_dur, export, p_prev_end + 2, 95)
+        _mux_final(job_id, st, o, vtrack_e, out_wav, out_mp4, out_dur, out_dur, False, 95, 99, 'Writing MP4')
+    else:
+        _mux_final(job_id, st, o, None, out_wav, out_mp4, out_dur, out_dur, False, p_prev_end + 2, 99,
+                   'Exporting video')
     with jobs_lock:
         j = jobs[job_id]
-        j.update({'status': 'done', 'file_mp4': out_mp4, 'file_mp3': mp3, 'synced_wav': out_wav,
-                  'out_dur': out_dur})
+        j.update({'status': 'done', 'file_mp4': out_mp4, 'synced_wav': out_wav, 'out_dur': out_dur})
     _step(job_id, 'Done!', 100)
     _push(job_id, {'type': 'done'})
+    _prune_later(job_id, keep_last_done=False)
+    _full_mp3_later(st)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1534,14 +1963,54 @@ def _run(job_id, p):
             while not _analysis_slots.acquire(timeout=1):
                 _check_cancel(job_id)
         try:
-            _step(job_id, 'Preparing video...', 3)
-            vid_file, vid_audio, vid_info = _prepare_video(
-                job_id, p['video_url'], p['video_file'], tmp, p['vid_trim_start'], p['vid_trim_end'])
-            _check_cancel(job_id)
+            _step(job_id, 'Preparing video and song...', 3)
+            # Video and song are fetched / decoded at the same time (two downloads in parallel).
+            song_box = {}
 
-            _step(job_id, 'Preparing song...', 12)
-            song_wav = _prepare_song(job_id, p['song_url'], p['song_file'], tmp,
-                                     p['song_trim_start'], p['song_trim_end'])
+            def stop_other_side():
+                with jobs_lock:
+                    j = jobs.get(job_id)
+                if j:
+                    _kill_procs(j)
+
+            def prep_song():
+                try:
+                    song_box['wav'] = _prepare_song(job_id, p['song_url'], p['song_file'], tmp,
+                                                    p['song_trim_start'], p['song_trim_end'])
+                except BaseException as e:   # noqa: B902 — re-raised in the main thread
+                    song_box['err'] = e
+                    if not isinstance(e, Cancelled):
+                        stop_other_side()        # no point finishing the video download
+            song_thread = threading.Thread(target=prep_song, daemon=True)
+            song_thread.start()
+            try:
+                vid_file, vid_audio, vid_info, vid_trim = _prepare_video(
+                    job_id, p['video_url'], p['video_file'], tmp, p['vid_trim_start'], p['vid_trim_end'])
+            except BaseException:
+                stop_other_side()                # stop the song download too
+                song_thread.join(30)
+                err = song_box.get('err')
+                if err is not None and not isinstance(err, Cancelled):
+                    raise err                    # the song failed first: report that, not the side effect
+                raise
+            if vid_info.get('audio_only'):
+                _push(job_id, {'type': 'warn', 'msg': 'An audio file is in the video slot, so the MP4 has a plain '
+                                                      'black picture. "Synced audio" is the mix you want.'})
+
+            # When the export picture can't depend on the analysis (Match Video tempo, no beat
+            # effects), start encoding it now, in the background, while the audio is analysed.
+            opts = p['opts']
+            if p['bpm_mode'] == 'video' and not opts['effects'] and vid_info['dur'] > 0:
+                _export_track({'root_tmp': tmp, 'vid_file': vid_file, 'vid_trim': vid_trim,
+                               'vid_info': vid_info, 'video_speed': None, 'opts': opts},
+                              opts, vid_info['dur'])
+
+            while song_thread.is_alive():
+                song_thread.join(0.5)
+                _check_cancel(job_id)
+            if 'err' in song_box:
+                raise song_box['err']
+            song_wav = song_box['wav']
             _check_cancel(job_id)
 
             sr, render_sr = 22050, 44100
@@ -1554,15 +2023,18 @@ def _run(job_id, p):
             if vid_info['dur'] <= 0:
                 vid_info['dur'] = len(vid_y) / sr
 
-            _step(job_id, 'Detecting video BPM...', 28)
-            vid_feat = _analysis_features(vid_y, sr)
-            _check_cancel(job_id)
-            vid_tempo, vid_beats, vid_conf, vid_music_start, _ = _detect_bpm(vid_y, sr, vid_feat)
-            _check_cancel(job_id)
-            _step(job_id, 'Detecting song BPM...', 38)
-            song_feat = _analysis_features(song_y, sr)
-            _check_cancel(job_id)
-            song_tempo, _, song_conf, song_music_start, song_beats = _detect_bpm(song_y, sr, song_feat)
+            # Video and song are analysed at the same time (independent work, separate CPU cores).
+            _step(job_id, 'Detecting video and song BPM...', 28)
+
+            def analyse(y):
+                feat = _analysis_features(y, sr)
+                return feat, _detect_bpm(y, sr, feat)
+            with ThreadPoolExecutor(2) as ex:
+                f_vid, f_song = ex.submit(analyse, vid_y), ex.submit(analyse, song_y)
+                vid_feat, (vid_tempo, vid_beats, vid_conf, vid_music_start, _) = f_vid.result()
+                _check_cancel(job_id)
+                _step(job_id, 'Detecting song BPM...', 38)
+                song_feat, (song_tempo, _, song_conf, song_music_start, song_beats) = f_song.result()
             del song_y                       # features hold everything the analysis needs
             _check_cancel(job_id)
             _push(job_id, {'type': 'info', 'vid_music_start': round(vid_music_start / sr, 2),
@@ -1585,9 +2057,12 @@ def _run(job_id, p):
                     preserve = resample = song_hq
                 else:
                     _step(job_id, f'Stretching {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)...', 46)
-                    preserve, engine = _time_stretch(song_hq, render_sr, stretch_ratio)
+                    with ThreadPoolExecutor(1) as ex:    # the turntable version is made alongside
+                        f_res = ex.submit(librosa.resample, song_hq, orig_sr=render_sr * stretch_ratio,
+                                          target_sr=render_sr)
+                        preserve, engine = _time_stretch(song_hq, render_sr, stretch_ratio)
+                        resample = f_res.result()
                     _check_cancel(job_id)
-                    resample = librosa.resample(song_hq, orig_sr=render_sr * stretch_ratio, target_sr=render_sr)
             _check_cancel(job_id)
 
             target_tempo = song_tempo if bpm_mode == 'song' else vid_tempo
@@ -1653,7 +2128,7 @@ def _run(job_id, p):
             auto_off = int(round(best_off * render_sr / sr))
             st = {
                 'root_tmp': tmp,
-                'vid_file': vid_file, 'vid_info': vid_info,
+                'vid_file': vid_file, 'vid_info': vid_info, 'vid_trim': vid_trim,
                 'full_preserve_wav': full_preserve, 'full_resample_wav': full_resample,
                 'preserve_pitch': p['preserve_pitch'], 'render_sr': render_sr,
                 'auto_offset_samples': auto_off, 'offset_samples': auto_off,
@@ -1676,20 +2151,25 @@ def _run(job_id, p):
                        'beat_interval': round(bi, 5), 'song_duration': st['song_duration'],
                        'beats_per_bar': bpb, 'meter_detected': song_bpb > 1,
                        'micro_align_ms': round(micro_ms, 1)})
+        out_dir = os.path.join(tmp, 'render')
+        os.makedirs(out_dir, exist_ok=True)
         with jobs_lock:
             jobs[job_id]['state'] = st           # from here on, adjustments are possible
+            jobs[job_id]['out_dir'] = out_dir
         published = True
-        _render(job_id, st, tmp, p_start=66)
+        _render(job_id, st, out_dir, p_start=66)
 
     except Cancelled:
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id]['status'] = 'cancelled'
         if not published:
+            _cancel_inflight(tmp)
             shutil.rmtree(tmp, ignore_errors=True)
         _push(job_id, {'type': 'cancelled'})
     except Exception as e:
         if not published:
+            _cancel_inflight(tmp)
             shutil.rmtree(tmp, ignore_errors=True)
         with jobs_lock:
             if job_id in jobs:
@@ -1704,6 +2184,7 @@ def _run_derived(job_id):
         if not j:
             return
         j['tmp'] = tmp
+        j['out_dir'] = tmp
         j['status'] = 'running'
         st = j['state']
     try:
@@ -1861,29 +2342,45 @@ def api_info():
 
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
-    f = request.files.get('file')
-    if not f:
+    """Two forms: the raw file as the request body (?name=...), streamed straight to disk — no
+    multipart parsing — or the old multipart form field 'file' (spooled into the temp folder
+    and then just renamed)."""
+    f = request.files.get('file') if request.mimetype == 'multipart/form-data' else None
+    name = f.filename if f else (request.args.get('name') or '')
+    if not f and not request.content_length:
         return jsonify({'error': 'No file received.'}), 400
-    fname = secure_filename(f.filename) or 'upload'
-    ext = Path(fname).suffix.lower()
+    ext = Path(name).suffix.lower()
     if ext not in ALLOWED_VIDEO | ALLOWED_AUDIO:
         return jsonify({'error': f'Unsupported file type: {ext or "unknown"}'}), 400
+    fname = secure_filename(name)
+    if not fname.lower().endswith(ext):          # e.g. an Arabic file name becomes empty when made ASCII
+        fname = 'upload' + ext
     tmp = _mkdtemp('beatsync_up_')
     dest = os.path.join(tmp, fname)
-    spool = getattr(f.stream, 'name', None)
-    if isinstance(spool, str) and os.path.isfile(spool):
-        f.stream.close()
-        try:
-            os.replace(spool, dest)
-        except OSError:                          # different drive: copy, then drop the spool
-            shutil.copyfile(spool, dest)
-            os.remove(spool)
-    else:
-        f.save(dest)
+    try:
+        if f:
+            spool = getattr(f.stream, 'name', None)
+            if isinstance(spool, str) and os.path.isfile(spool):
+                f.stream.close()
+                try:
+                    os.replace(spool, dest)
+                except OSError:                  # different drive: copy, then drop the spool
+                    shutil.copyfile(spool, dest)
+                    os.remove(spool)
+            else:
+                f.save(dest, buffer_size=4 * 1024 * 1024)
+        else:
+            with open(dest, 'wb') as out:
+                shutil.copyfileobj(request.stream, out, 4 * 1024 * 1024)
+        if os.path.getsize(dest) == 0:
+            raise RuntimeError('The file is empty.')
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return jsonify({'error': f'Upload failed: {e}'}), 400
     file_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[file_id] = {'kind': 'upload', 'path': dest, 'tmp': tmp, 'ext': ext, 'created_at': time.time()}
-    return jsonify({'file_id': file_id, 'name': f.filename, 'ext': ext})
+    return jsonify({'file_id': file_id, 'name': name, 'ext': ext})
 
 
 def _opt_float(v):
@@ -2016,18 +2513,27 @@ def resolve_file(kind, job_id):
     if kind == 'video':
         path = j.get('file_mp4')
     elif kind == 'full':
-        path = j.get('file_mp3')
+        path = _ensure_full_mp3(None, j['state'])
     elif kind == 'synced':
         path = j.get('file_synced_mp3')
         if not path or not os.path.exists(path):
             st = j['state']
-            path = os.path.join(j['tmp'], 'synced_audio.mp3')
-            fc, amap = _audio_graph(st, st['opts'], j['out_dur'])
-            args = ['-i', st['vid_file'], '-i', j['synced_wav']]
+            base = j.get('out_dir')
+            if not base or not j.get('synced_wav'):
+                raise FileNotFoundError('File not found')
+            path = os.path.join(base, 'synced_audio.mp3')
+            if _mixing(st, st['opts']):          # only touch the video's audio when it is used
+                args = _orig_audio_in(None, st, full=True) + ['-i', j['synced_wav']]
+                fc, amap = _audio_graph(st, st['opts'], j['out_dur'], orig='0:a:0', song='1:a:0')
+            else:
+                args = ['-i', j['synced_wav']]
+                fc, amap = _audio_graph(st, st['opts'], j['out_dur'], song='0:a:0')
             if fc:
                 args += ['-filter_complex', ';'.join(fc)]
-            args += ['-map', amap, '-t', f'{j["out_dur"]:.3f}', '-codec:a', 'libmp3lame', '-b:a', '320k', path]
+            part = path + '.part.mp3'
+            args += ['-map', amap, '-t', f'{j["out_dur"]:.3f}', '-codec:a', 'libmp3lame', '-b:a', '320k', part]
             _ffmpeg(None, args)
+            os.replace(part, path)
             with jobs_lock:
                 j['file_synced_mp3'] = path
     else:

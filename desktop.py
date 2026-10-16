@@ -63,8 +63,12 @@ def hide_child_consoles():
     original = subprocess.Popen.__init__
 
     def patched(self, *args, **kwargs):
-        if not kwargs.get('creationflags'):
-            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        # Always add CREATE_NO_WINDOW, also when a caller passes other flags (e.g. a lower
+        # CPU priority) — replacing only empty flags let those calls open a cmd window.
+        flags = kwargs.get('creationflags') or 0
+        if not flags & (subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS):
+            flags |= subprocess.CREATE_NO_WINDOW
+        kwargs['creationflags'] = flags
         original(self, *args, **kwargs)
 
     subprocess.Popen.__init__ = patched
@@ -303,6 +307,26 @@ def warm_up():
 
 # ── JavaScript bridge (window.pywebview.api.* in the page) ───────────────────
 
+def place_file(src, dest):
+    """Put a finished file at `dest`. On the same drive this is a hard link: instant and no extra
+    disk space, even for a multi-GB export (the temp name is simply removed later). Otherwise —
+    another drive, FAT/exFAT, a synced folder that refuses links — a normal copy."""
+    part = dest + '.beatsync-part'
+    try:
+        if os.path.exists(part):
+            os.remove(part)
+        os.link(src, part)
+        os.replace(part, dest)
+        return
+    except OSError:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+    shutil.copyfile(src, dest)
+
+
+
 class Api:
     def __init__(self):
         self._window = None
@@ -341,10 +365,26 @@ class Api:
         if not dest.lower().endswith(ext):
             dest += ext
         try:
-            shutil.copyfile(path, dest)
+            place_file(path, dest)
         except OSError as e:
             return {'ok': False, 'error': f'Could not save: {e}'}
         return {'ok': True, 'path': dest}
+
+    def pick_file(self, src):
+        """Native Open dialog. The file is used where it is — no upload and no copy, so even a
+        multi-GB video is ready instantly."""
+        audio = '*.mp3;*.wav;*.flac;*.aac;*.ogg;*.m4a;*.opus'
+        if src == 'vid':
+            types = (f'Video or audio (*.mp4;*.mkv;*.webm;*.mov;*.avi;*.m4v;{audio})', 'All files (*.*)')
+        else:
+            types = (f'Audio ({audio})', 'All files (*.*)')
+        path = self._first(self._window.create_file_dialog(self._dialog('open'), file_types=types))
+        if not path:
+            return {'ok': False, 'cancelled': True}
+        try:
+            return dict(self._server.register_local(path), ok=True)
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
 
     def reveal(self, path):
         """Show a file in Explorer / Finder."""

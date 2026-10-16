@@ -781,26 +781,42 @@
     $(t.dataset.trim + '-trim').classList.toggle('hidden', !open);
   }));
 
+  function markFile(src, name, size) {
+    const dz = $(src + '-drop');
+    dz.classList.add('has-file');
+    dz.querySelector('.dz-text').textContent = '✓ ' + name;
+    dz.querySelector('.dz-sub').textContent = (size / 1048576).toFixed(1) + ' MB · click to replace';
+  }
+  // The raw file is the request body: the server streams it straight to disk (no form parsing).
   function uploadFile(file, src) {
-    const bar = $(src + '-upbar'), dz = $(src + '-drop');
+    const bar = $(src + '-upbar');
     bar.style.display = 'block'; bar.firstElementChild.style.width = '0%';
-    const fd = new FormData(); fd.append('file', file);
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/api/upload');
+      xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
       xhr.upload.onprogress = e => { if (e.lengthComputable) bar.firstElementChild.style.width = (e.loaded / e.total * 100).toFixed(1) + '%'; };
       xhr.onload = () => {
         bar.style.display = 'none';
         let d = {}; try { d = JSON.parse(xhr.responseText); } catch (e) {}
         if (xhr.status !== 200 || d.error) { reject(new Error(d.error || 'Upload failed (HTTP ' + xhr.status + ')')); return; }
-        dz.classList.add('has-file');
-        dz.querySelector('.dz-text').textContent = '✓ ' + d.name;
-        dz.querySelector('.dz-sub').textContent = (file.size / 1048576).toFixed(1) + ' MB · click to replace';
+        markFile(src, d.name, file.size);
         resolve(d.file_id);
       };
       xhr.onerror = () => { bar.style.display = 'none'; reject(new Error('Upload error — check your connection')); };
-      xhr.send(fd);
+      xhr.send(file);
     });
+  }
+  // Desktop app: clicking opens the native dialog and the file is used where it is (instant, no copy).
+  async function pickNative(src) {
+    hideErr();
+    try {
+      const r = await window.pywebview.api.pick_file(src);
+      if (!r || r.cancelled) return;
+      if (!r.ok) throw new Error(r.error || 'Could not open that file.');
+      S.src[src].fileId = r.file_id;
+      markFile(src, r.name, r.size);
+    } catch (err) { S.src[src].fileId = null; showErr(err.message || String(err)); }
   }
   ['vid', 'song'].forEach(src => {
     const dz = $(src + '-drop'), input = $(src + '-file');
@@ -809,6 +825,9 @@
       try { S.src[src].fileId = await uploadFile(file, src); toast('Uploaded ' + file.name, 'success'); }
       catch (err) { S.src[src].fileId = null; showErr(err.message); }
     };
+    input.addEventListener('click', e => {
+      if (isDesktop() && window.pywebview.api.pick_file) { e.preventDefault(); pickNative(src); }
+    });
     input.addEventListener('change', () => handle(input.files[0]));
     dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
     dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
