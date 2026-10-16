@@ -327,10 +327,10 @@
       </div>
       <div id="vid-file-panel" class="hidden">
         <div class="dropzone" id="vid-drop">
-          <input type="file" id="vid-file" accept=".mp4,.mkv,.webm,.mov,.avi,.m4v" aria-label="Video file">
+          <input type="file" id="vid-file" accept=".mp4,.mkv,.webm,.mov,.avi,.m4v,.mp3,.wav,.flac,.aac,.ogg,.m4a,.opus" aria-label="Video or audio file">
           <div class="dz-icon">&#127916;</div>
           <div class="dz-text">Drop video or <span>browse</span></div>
-          <div class="dz-sub">MP4 · MOV · MKV · WEBM · AVI</div>
+          <div class="dz-sub">MP4 · MOV · MKV · WEBM · AVI · or audio: MP3 · WAV</div>
         </div>
         <div class="upbar" id="vid-upbar"><div></div></div>
       </div>
@@ -1252,7 +1252,7 @@
       S.src[src].fileId = null;
       const dz = $(src + '-drop'); dz.classList.remove('has-file');
       dz.querySelector('.dz-text').innerHTML = 'Drop ' + (src === 'vid' ? 'video' : 'audio') + ' or <span>browse</span>';
-      dz.querySelector('.dz-sub').textContent = src === 'vid' ? 'MP4 · MOV · MKV · WEBM · AVI' : 'MP3 · WAV · FLAC · M4A · OGG · OPUS';
+      dz.querySelector('.dz-sub').textContent = src === 'vid' ? 'MP4 · MOV · MKV · WEBM · AVI · or audio: MP3 · WAV' : 'MP3 · WAV · FLAC · M4A · OGG · OPUS';
       $(src + '-file').value = '';
     });
     S.opts = defaultOpts(); Object.keys(FDEF).forEach(k => setFilter(k, FDEF[k], true)); markPreset('natural'); renderColorCount();
