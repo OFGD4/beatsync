@@ -28,6 +28,8 @@ Much faster with big video files, with the same beat analysis as 3.2.0 and no lo
 
 **Fixed**
 - A cmd window opened for every ffmpeg run (adding a video, rendering).
+- Space sometimes paused the preview and then it played again: after a click on the player,
+  its own controls also reacted to the key. Holding Space a little long also toggled twice.
 - Temp files from older adjustments are deleted as you go. Before, every nudge left a full-size
   export on disk until the session ended.
 - A failed song download stops the video download straight away and shows the real error.

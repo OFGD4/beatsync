@@ -1239,6 +1239,12 @@
   requestAnimationFrame(ledLoop);
 
   // ── Keyboard ──────────────────────────────────────────────────────────
+  // Space toggles play exactly once. After a click on the player, its own controls keep the
+  // focus and act on the key *release*, which undid the pause (stop → play again).
+  let spaceHandled = false;
+  window.addEventListener('keyup', e => {
+    if (e.key === ' ' && spaceHandled) { spaceHandled = false; e.preventDefault(); e.stopPropagation(); }
+  }, true);
   document.addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); if (!$('run-btn').disabled) $('run-btn').click(); return; }
     const tag = (document.activeElement && document.activeElement.tagName) || '';
@@ -1250,7 +1256,10 @@
       if (e.shiftKey) { if (!S.lock) scheduleAdjust({ ms: 10 * dir }); else toast('Turn off Grid lock (L) for ms fine-tuning'); }
       else scheduleAdjust({ beats: unitBeats() * dir });
     } else if (e.key === ' ') {
-      e.preventDefault(); const v = $('video'); v.paused ? v.play().catch(() => {}) : v.pause();
+      e.preventDefault();
+      if (e.repeat) return;                                   // holding Space must not toggle again
+      spaceHandled = true;
+      const v = $('video'); v.paused ? v.play().catch(() => {}) : v.pause();
     } else if (e.key === 'r' || e.key === 'R') { scheduleAdjust({ reset: true }); }
     else if (e.key === 'l' || e.key === 'L') { $('lock').click(); }
     else if (/^[1-5]$/.test(e.key)) { S.unit = ['bar', 'beat', 'half', 'quarter', 'eighth'][+e.key - 1]; setSeg('unit-seg', 'unit', S.unit); updateUnitLabels(); }
