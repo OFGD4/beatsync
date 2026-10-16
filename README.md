@@ -2,6 +2,7 @@
 
 Beat-align any song to any video. It matches the tempo, locks the song's kick drum to the video's beat,
 and adds beat-synced effects, color grading and export options.
+The video slot also takes an audio file (MP3, WAV, …) to match one track to another.
 
 Runs as a **Windows desktop app**, or as a local web app in your browser.
 

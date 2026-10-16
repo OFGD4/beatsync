@@ -14,7 +14,7 @@ Old endpoints (/api/nudge, /api/seek, /api/repitch, /api/rerender) still work
 and are thin wrappers around /api/adjust.
 """
 
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from flask import Flask, Request, request, jsonify, send_file, send_from_directory, Response
 from flask_cors import CORS
 import subprocess
 import threading
@@ -43,9 +43,19 @@ TEMP_ROOT = os.environ.get('BEATSYNC_TEMP') or None     # desktop app: %LOCALAPP
 MAX_ANALYSIS_WORKERS = int(os.environ.get('BEATSYNC_WORKERS', '2'))
 JOB_TTL_SEC = 2 * 60 * 60
 
+class _UploadRequest(Request):
+    """Spool uploaded files straight into the BeatSync temp folder, so a multi-GB
+    video is written once and then just renamed (not copied through the system temp)."""
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        if TEMP_ROOT:
+            os.makedirs(TEMP_ROOT, exist_ok=True)
+        return tempfile.NamedTemporaryFile('wb+', dir=TEMP_ROOT, prefix='beatsync_spool_', delete=False)
+
+
 app = Flask(__name__)
+app.request_class = _UploadRequest
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024 * 1024  # 20 GB (long 4K videos)
 
 # cookies.txt (Netscape format) helps with YouTube "Sign in to confirm" checks.
 # Looked up in the user data folder first (Settings → Import cookies), then next to the app.
@@ -304,6 +314,15 @@ def _cleanup_loop():
                     stale_roots.append(jid)
             for jid in stale_uploads:
                 shutil.rmtree(jobs.pop(jid).get('tmp', ''), ignore_errors=True)
+        # Spool files of uploads that were aborted half-way
+        spool_dir = TEMP_ROOT or tempfile.gettempdir()
+        try:
+            for name in os.listdir(spool_dir):
+                f = os.path.join(spool_dir, name)
+                if name.startswith('beatsync_spool_') and now - os.path.getmtime(f) > JOB_TTL_SEC:
+                    os.remove(f)
+        except OSError:
+            pass
         for rid in stale_roots:
             _delete_lineage(rid)
 
@@ -331,14 +350,28 @@ def _friendly(err):
 # ffmpeg runner with real progress + cancellation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=3600):
-    cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostats', '-y']
+# Encoders run one step below normal priority: they still get every idle CPU
+# cycle (same speed), but the rest of the PC stays responsive during long renders.
+if os.name == 'nt':
+    _LOW_PRIO = {'creationflags': getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)}
+    _NICE = []
+else:
+    _LOW_PRIO = {}
+    _NICE = ['nice', '-n', '5'] if shutil.which('nice') else []
+
+
+def _ffmpeg(job_id, args, dur=None, p0=None, p1=None, label=None, timeout=None):
+    if timeout is None:
+        # Long, heavy sources on the "high" preset can take several times real time;
+        # a fixed 1 h limit used to kill those exports. Cancel still works at any time.
+        timeout = max(4 * 3600, (dur or 0) * 40)
+    cmd = _NICE + ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostats', '-y']
     if job_id and dur:
         cmd += ['-progress', 'pipe:1']
     cmd += args
     with tempfile.TemporaryFile(mode='w+') as errf:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if (job_id and dur) else subprocess.DEVNULL,
-                                stderr=errf, text=True)
+                                stderr=errf, text=True, **_LOW_PRIO)
         j = None
         if job_id:
             with jobs_lock:
@@ -467,7 +500,7 @@ def _ytdlp_error(lines, rc):
     return RuntimeError((errs[-1] if errs else (lines[-1] if lines else f'yt-dlp exit code {rc}')))
 
 
-def _ytdlp(job_id, args, label, p0, p1, timeout=3600):
+def _ytdlp(job_id, args, label, p0, p1, timeout=4 * 3600):
     cmd = _ytdlp_cmd()
     if not cmd:
         raise _ytdlp_missing()
@@ -544,10 +577,18 @@ def _dl_video(url, tmp, name, job_id=None, p0=0, p1=0):
                            'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b'),
                     '--merge-output-format', 'mp4',
                     '-o', os.path.join(tmp, f'{name}.%(ext)s'), url], 'Downloading video', p0, p1)
-    files = [f for f in Path(tmp).glob(f'{name}.*') if f.suffix.lower() in ALLOWED_VIDEO]
+    files = [f for f in Path(tmp).glob(f'{name}.*') if f.suffix.lower() in ALLOWED_VIDEO | ALLOWED_AUDIO]
     if not files:
         raise RuntimeError(f'Failed to download: {name}')
     return str(files[0])
+
+
+def _link_or_copy(src, dst):
+    """Hard-link when possible (instant, no extra disk for multi-GB uploads), else copy."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def _upload_path(file_id):
@@ -567,22 +608,63 @@ def _trim_args(start, end):
     return a
 
 
+def _stream_info(path):
+    """(has_video, duration_sec) via ffprobe. Cover art in an MP3/M4A does not count as video."""
+    r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                        'stream=codec_type:stream_disposition=attached_pic:format=duration',
+                        '-of', 'json', path], capture_output=True, text=True, timeout=60)
+    try:
+        info = json.loads(r.stdout or '{}')
+    except json.JSONDecodeError:
+        info = {}
+    has_video = any(st.get('codec_type') == 'video' and not (st.get('disposition') or {}).get('attached_pic')
+                    for st in info.get('streams', []))
+    try:
+        dur = float(info.get('format', {}).get('duration') or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return has_video, dur
+
+
+def _audio_as_video(job_id, src, tmp, trim_start, trim_end):
+    """An audio file in the video slot: give it a plain black picture so the
+    preview / export pipeline works unchanged. The audio stays lossless (FLAC),
+    and the trim is applied in the same pass."""
+    _, dur = _stream_info(src)
+    start = trim_start or 0.0
+    out_dur = (trim_end - start) if trim_end is not None else max(0.1, dur - start)
+    out = os.path.join(tmp, 'vid_from_audio.mkv')
+    t = _trim_args(trim_start, trim_end)
+    _step(job_id, 'Audio in the video slot — adding a black picture...', 9)
+    _ffmpeg(job_id, ['-f', 'lavfi', '-i', 'color=c=black:s=1280x720:r=30'] + t[:2] + ['-i', src] +
+            ['-t', f'{out_dur:.3f}', '-map', '0:v:0', '-map', '1:a:0',
+             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '28',
+             '-pix_fmt', 'yuv420p', '-c:a', 'flac', out],
+            dur=out_dur, p0=9, p1=11, label='Preparing audio')
+    return out
+
+
 def _prepare_video(job_id, url, file_id, tmp, trim_start, trim_end):
     if file_id:
         src, ext = _upload_path(file_id)
         vid = os.path.join(tmp, f'vid{ext}')
-        shutil.copy2(src, vid)
+        _link_or_copy(src, vid)
     else:
         vid = _dl_video(url, tmp, 'vid', job_id, 3, 9)
 
-    if trim_start is not None or trim_end is not None:
+    if not _stream_info(vid)[0]:
+        vid = _audio_as_video(job_id, vid, tmp, trim_start, trim_end)
+    elif trim_start is not None or trim_end is not None:
         # Frame-accurate trim (stream-copy would snap to the previous keyframe
         # and silently shift the beat grid).
         _step(job_id, 'Trimming video (frame-accurate)...', 9)
         trimmed = os.path.join(tmp, 'vid_trimmed.mp4')
+        start = trim_start or 0.0
+        t_dur = (trim_end - start) if trim_end is not None else max(0.1, _probe_video(vid)['dur'] - start)
         _ffmpeg(job_id, _trim_args(trim_start, trim_end)[:2] + ['-i', vid] + _trim_args(trim_start, trim_end)[2:] +
                 ['-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-crf', '17', '-preset', 'veryfast',
-                 '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', trimmed])
+                 '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', trimmed],
+                dur=t_dur, p0=9, p1=11, label='Trimming video')
         vid = trimmed
 
     info = _probe_video(vid)
@@ -599,7 +681,7 @@ def _prepare_song(job_id, url, file_id, tmp, trim_start, trim_end):
     if file_id:
         src, ext = _upload_path(file_id)
         raw = os.path.join(tmp, f'song_src{ext}')
-        shutil.copy2(src, raw)
+        _link_or_copy(src, raw)
     else:
         raw = _dl_audio(url, tmp, 'song_src', job_id, 12, 18)
     wav = os.path.join(tmp, 'song.wav')
@@ -615,6 +697,11 @@ def _prepare_song(job_id, url, file_id, tmp, trim_start, trim_end):
 # Analysis: BPM, music start, meter, downbeats, offset, beat grid
 # ─────────────────────────────────────────────────────────────────────────────
 
+HOP = 256                    # analysis hop at 22050 Hz (11.6 ms)
+N_FFT = 2048
+CHUNK_SEC = 60.0             # long files are analysed in chunks of this size (flat memory)
+
+
 def _refine_bpm(beat_times):
     import numpy as np
     bt = np.atleast_1d(beat_times)
@@ -628,66 +715,133 @@ def _refine_bpm(beat_times):
     return round(60.0 / float(np.mean(clean)), 4)
 
 
-def _find_music_start(y, sr, hop=512, window_sec=4.0, threshold_ratio=0.15):
+def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
+    """
+    Every spectral feature the analysis needs, in one pass over the signal.
+    Runs in overlapping chunks, so memory stays flat for hour-long files (a
+    single STFT + HPSS of a long file needs several GB), and the features are
+    shared by every later step instead of being recomputed.
+      oenv      — onset strength, same as librosa.onset.onset_strength(y, hop)
+      oenv_perc — onset strength of the percussive part (HPSS, margin 3)
+      low_env   — onset envelope of the ≤250 Hz band (kicks / downbeats)
+    """
     import numpy as np
     import librosa
-    oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    y = np.asarray(y, dtype=np.float32)
+    n = len(y)
+    step = 2 * hop                                   # HPSS uses a 2×hop STFT; keep chunks on its grid
+    chunk = max(step, int(chunk_sec * sr) // step * step)
+    pad = (N_FFT // step + 40) * step                # STFT window + HPSS median-filter context
+    n_frames = 1 + n // hop
+    low = librosa.fft_frequencies(sr=sr, n_fft=N_FFT) <= 250
+    mel_basis = librosa.filters.mel(sr=sr, n_fft=N_FFT)
+    mel, mel_perc, low_mag = [], [], []
+    for a in range(0, max(n, 1), chunk):
+        b = min(n, a + chunk)
+        s0, s1 = max(0, a - pad), min(n, b + pad)
+        seg = y[s0:s1]
+        f0 = a // hop - s0 // hop
+        f1 = (b // hop if b < n else n_frames) - s0 // hop
+        D = np.abs(librosa.stft(seg, n_fft=N_FFT, hop_length=hop))[:, f0:f1]
+        mel.append(mel_basis @ (D ** 2))
+        low_mag.append(D[low])
+        y_perc = librosa.effects.hpss(seg, margin=3.0)[1]
+        P = np.abs(librosa.stft(y_perc, n_fft=N_FFT, hop_length=hop))[:, f0:f1]
+        mel_perc.append(mel_basis @ (P ** 2))
+        del D, P, y_perc
+    S = librosa.power_to_db(np.concatenate(mel, axis=1))
+    oenv = librosa.onset.onset_strength(S=S, sr=sr, hop_length=hop)
+    S = librosa.power_to_db(np.concatenate(mel_perc, axis=1))
+    oenv_perc = librosa.onset.onset_strength(S=S, sr=sr, hop_length=hop)
+    L = librosa.amplitude_to_db(np.concatenate(low_mag, axis=1), ref=np.max)
+    low_env = np.concatenate([[0], np.maximum(0, np.diff(L, axis=1)).mean(axis=0)])
+    return {'oenv': oenv, 'oenv_perc': oenv_perc, 'low_env': low_env, 'sr': sr, 'hop': hop}
+
+
+def _retime(env, rate):
+    """Envelope as it would be after a time-stretch by `rate` (>1 = faster).
+    Far cheaper than stretching the audio and analysing it again."""
+    import numpy as np
+    env = np.asarray(env, dtype=np.float64)
+    if abs(rate - 1.0) < 1e-6:
+        return env
+    n_out = max(1, int(len(env) / rate))
+    return np.interp(np.arange(n_out) * rate, np.arange(len(env)), env)
+
+
+def _music_start_frame(oenv, sr, hop, window_sec=4.0, threshold_ratio=0.15):
+    import numpy as np
     window_frames = int(window_sec * sr / hop)
     threshold = (float(np.max(oenv)) + 1e-9) * threshold_ratio
     for i in range(0, max(1, len(oenv) - window_frames), max(1, window_frames // 2)):
         if float(np.mean(oenv[i:i + window_frames])) >= threshold:
-            return int(librosa.frames_to_samples(max(0, i - window_frames // 4), hop_length=hop))
+            return max(0, i - window_frames // 4)
     return 0
 
 
-def _detect_bpm(y, sr):
+def _chunks(n, chunk, ctx):
+    """(core_start, core_end, seg_start, seg_end) for processing n frames in chunks with context."""
+    for a in range(0, max(n, 1), chunk):
+        b = min(n, a + chunk)
+        yield a, b, max(0, a - ctx), min(n, b + ctx)
+
+
+def _mean_tempogram(oenv, sr, hop, win=384, chunk=4096):
+    import librosa
+    total, count = None, 0
+    for a, b, s0, s1 in _chunks(len(oenv), chunk, win):
+        tg = librosa.feature.tempogram(onset_envelope=oenv[s0:s1], sr=sr, hop_length=hop, win_length=win)
+        part = tg[:, a - s0:b - s0].sum(axis=1)
+        total = part if total is None else total + part
+        count += b - a
+    return total / max(1, count)
+
+
+def _tracker_tempo(oenv, sr, hop, start_bpm=120.0, std_bpm=1.0, max_tempo=320.0):
+    """Exactly the tempo librosa.beat.beat_track estimates, but from a chunked
+    tempogram: beat_track builds one for the whole file (several GB for an hour)."""
+    import numpy as np
+    import librosa
+    win = int(librosa.time_to_frames(8.0, sr=sr, hop_length=hop))
+    tg = _mean_tempogram(oenv, sr, hop, win=win)
+    bpms = librosa.tempo_frequencies(win, sr=sr, hop_length=hop)
+    with np.errstate(divide='ignore'):
+        logprior = -0.5 * ((np.log2(bpms) - np.log2(start_bpm)) / std_bpm) ** 2
+    logprior[:int(np.argmax(bpms < max_tempo))] = -np.inf
+    return float(bpms[int(np.argmax(np.log1p(1e6 * tg) + logprior))])
+
+
+def _detect_bpm(y, sr, feat=None):
+    """Returns (bpm, beat_times, confidence, music_start_samples, raw_beat_times).
+    beat_times are back-tracked to the onset; raw_beat_times are the tracker's
+    pulse positions (better for fitting a grid)."""
     import numpy as np
     import librosa
 
-    hop = 256
-    music_start = _find_music_start(y, sr, hop=hop)
-    y_rhythmic = y[music_start:] if music_start > 0 else y
+    hop = HOP
+    if feat is None:
+        feat = _analysis_features(y, sr, hop)
+    f0 = _music_start_frame(feat['oenv'], sr, hop)
+    music_start = f0 * hop
+    oenv_full = feat['oenv'][f0:]
+    oenv_perc = feat['oenv_perc'][f0:]
 
-    _, y_perc = librosa.effects.hpss(y_rhythmic, margin=3.0)
-    oenv_full = librosa.onset.onset_strength(y=y_rhythmic, sr=sr, hop_length=hop)
-    oenv_perc = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop)
+    tempo_a = _tracker_tempo(oenv_perc, sr, hop)
 
-    tempo_a, _ = librosa.beat.beat_track(onset_envelope=oenv_perc, sr=sr, hop_length=hop, units='time')
-    tempo_a = float(np.atleast_1d(tempo_a)[0])
+    mean_tg = _mean_tempogram(oenv_full, sr, hop)
+    bpm_axis = librosa.tempo_frequencies(len(mean_tg), sr=sr, hop_length=hop)
 
-    tempogram = librosa.feature.tempogram(onset_envelope=oenv_full, sr=sr, hop_length=hop)
-    bpm_axis = librosa.tempo_frequencies(tempogram.shape[0], sr=sr, hop_length=hop)
-    tempo_b = float(bpm_axis[np.argmax(np.mean(tempogram, axis=1))])
-
-    try:
-        plp = librosa.beat.plp(onset_envelope=oenv_perc, sr=sr, hop_length=hop)
-        plp_frames = np.where((plp[:-1] < plp[1:]) & (plp[1:] < np.roll(plp, -2)[1:]))[0]
-        if len(plp_frames) > 2:
-            intervals = np.diff(librosa.frames_to_time(plp_frames, sr=sr, hop_length=hop))
-            tempo_c = float(60.0 / np.median(intervals[intervals > 0]))
-        else:
-            tempo_c = tempo_a
-    except Exception:
-        tempo_c = tempo_a
-
-    raw = [tempo_a, tempo_b, tempo_c]
-    anchor = None
-    for i in range(len(raw)):
-        for j in range(i + 1, len(raw)):
-            ratio = raw[i] / raw[j] if raw[j] != 0 else 999
-            if 0.9 <= ratio <= 1.1:
-                anchor = (raw[i] + raw[j]) / 2.0
-                break
-        if anchor:
-            break
-    if anchor is None:
-        anchor = tempo_a
+    # The beat tracker's tempo is the anchor; the tempogram picks the octave.
+    # (Earlier versions also "voted" with a tempogram peak and a PLP estimate,
+    # but both were broken — lag 0 / rising edges — so they never took part.
+    # Making them work caused octave errors, so they are gone.)
+    anchor = tempo_a
 
     candidates = {round(anchor * m, 2) for m in (0.5, 1.0, 2.0) if 40 <= round(anchor * m, 2) <= 240}
     best_bpm, best_score = anchor, -1.0
     for cand in candidates:
         idx = int(np.argmin(np.abs(bpm_axis - cand)))
-        score = float(np.mean(tempogram[idx]))
+        score = float(mean_tg[idx])
         ratio = cand / anchor if anchor != 0 else 1.0
         if ratio > 1.5:
             score *= 0.85
@@ -697,28 +851,28 @@ def _detect_bpm(y, sr):
             best_score, best_bpm = score, cand
 
     _, beat_frames = librosa.beat.beat_track(onset_envelope=oenv_perc, sr=sr, hop_length=hop, bpm=best_bpm)
+    raw_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop) + (music_start / sr)
     beat_frames = librosa.onset.onset_backtrack(beat_frames, oenv_full)
     beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop) + (music_start / sr)
 
     refined = _refine_bpm(beat_times)
     if refined is not None:
         best_bpm = refined
+    # Beat-tracker times are quantised to 11.6 ms frames and wobble when
+    # back-tracked, which leaves ~0.5% tempo error: seconds of drift on a long
+    # video. Fit the period to the kick attacks of the whole track instead.
+    try:
+        precise = _precise_period(y, sr, 60.0 / best_bpm)
+        if precise:
+            best_bpm = 60.0 / precise
+    except Exception:
+        pass
 
     idx_best = int(np.argmin(np.abs(bpm_axis - best_bpm)))
-    peak_energy = float(np.mean(tempogram[idx_best]))
-    total_energy = float(np.sum(np.mean(tempogram, axis=1)) + 1e-9)
+    peak_energy = float(mean_tg[idx_best])
+    total_energy = float(np.sum(mean_tg) + 1e-9)
     confidence = min(1.0, peak_energy / (total_energy / len(bpm_axis)) / 10.0)
-    return round(best_bpm, 4), beat_times, round(confidence, 3), music_start
-
-
-def _low_freq_onset_strength(y, sr, hop=512, fmax=250):
-    import numpy as np
-    import librosa
-    S = np.abs(librosa.stft(y, hop_length=hop))
-    freqs = librosa.fft_frequencies(sr=sr)
-    S_low_db = librosa.amplitude_to_db(S[freqs <= fmax, :], ref=np.max)
-    onset_env = np.maximum(0, np.diff(S_low_db, axis=1)).mean(axis=0)
-    return np.concatenate([[0], onset_env])
+    return round(best_bpm, 4), beat_times, round(confidence, 3), music_start, raw_times
 
 
 _METER_BIAS = {2: 0.95, 3: 1.00, 4: 1.05, 5: 0.85, 6: 1.00, 7: 0.80}
@@ -739,14 +893,14 @@ def _detect_meter(beat_energies):
     return best_meter, best_phase
 
 
-def _detect_downbeats(y, sr, beat_times, hop=256):
+def _detect_downbeats(low_env, sr, beat_times, hop=HOP):
     import numpy as np
     import librosa
+    beat_times = np.atleast_1d(beat_times)
     if len(beat_times) < 4:
         return beat_times, 1
-    low_oenv = _low_freq_onset_strength(y, sr, hop=hop)
-    beat_frames = np.clip(librosa.time_to_frames(beat_times, sr=sr, hop_length=hop), 0, len(low_oenv) - 1)
-    beat_energies = low_oenv[beat_frames]
+    beat_frames = np.clip(librosa.time_to_frames(beat_times, sr=sr, hop_length=hop), 0, len(low_env) - 1)
+    beat_energies = low_env[beat_frames]
     bpb, phase = _detect_meter(beat_energies)
     idx = np.arange(phase, len(beat_times), bpb)
     if float(np.mean(beat_energies[idx])) < (float(np.mean(beat_energies)) + 1e-9) * 1.05:
@@ -759,19 +913,32 @@ def _lcm(a, b):
     return a * b // gcd(a, b)
 
 
-def _find_beat_offset(vid_y, song_y, vid_beats, sr, hop=256):
-    """Returns (offset_samples, song_beat_times, song_downbeats, song_beats_per_bar)."""
+def _find_beat_offset(vid_feat, song_feat, vid_beats, song_beats, sr, vid_rate=1.0, song_rate=1.0):
+    """
+    Where in the song the video should start. Beat times / features are in each
+    source's original timeline; `*_rate` is the speed each one is played at in
+    the output (the song stretch, or the video speed-up in Match Song mode).
+    Returns (offset_samples @ sr, song_beat_times, song_downbeats, song_beats_per_bar),
+    all in output time.
+
+    Every candidate is scored at once with an FFT cross-correlation, so long
+    videos cost the same as short ones. A video longer than the song is matched
+    on the part that overlaps (it used to fall back to offset 0).
+    """
     import numpy as np
-    import librosa
+    from scipy.signal import correlate
 
-    _, song_beat_times = librosa.beat.beat_track(y=song_y, sr=sr, hop_length=hop, units='time')
-    song_beat_times = np.atleast_1d(song_beat_times)
-    if len(song_beat_times) == 0 or len(vid_beats) == 0:
-        return 0, song_beat_times, song_beat_times, 1
+    hop = HOP
+    song_beats = np.atleast_1d(np.asarray(song_beats, dtype=float))
+    vid_beats = np.atleast_1d(np.asarray(vid_beats, dtype=float))
+    if len(song_beats) == 0 or len(vid_beats) == 0:
+        sb = song_beats / song_rate
+        return 0, sb, sb, 1
 
-    vid_duration, song_duration = len(vid_y) / sr, len(song_y) / sr
-    vid_downbeats, vid_bpb = _detect_downbeats(vid_y, sr, vid_beats, hop)
-    song_downbeats, song_bpb = _detect_downbeats(song_y, sr, song_beat_times, hop)
+    vid_downbeats, vid_bpb = _detect_downbeats(vid_feat['low_env'], sr, vid_beats, hop)
+    song_downbeats, song_bpb = _detect_downbeats(song_feat['low_env'], sr, song_beats, hop)
+    vid_beats, vid_downbeats = vid_beats / vid_rate, np.atleast_1d(vid_downbeats) / vid_rate
+    song_beats, song_downbeats = song_beats / song_rate, np.atleast_1d(song_downbeats) / song_rate
     vid_first_downbeat = float(vid_downbeats[0]) if len(vid_downbeats) > 0 else float(vid_beats[0])
 
     lcm_beats = _lcm(vid_bpb, song_bpb)
@@ -779,64 +946,97 @@ def _find_beat_offset(vid_y, song_y, vid_beats, sr, hop=256):
     if lcm_beats <= 28 and len(song_downbeats) >= 2 and super_step >= 1:
         super_times = song_downbeats[::super_step]
         search_times = super_times if len(super_times) >= 2 else (
-            song_downbeats if len(song_downbeats) >= 3 else song_beat_times)
+            song_downbeats if len(song_downbeats) >= 3 else song_beats)
     elif len(song_downbeats) >= 3:
         search_times = song_downbeats
     else:
-        search_times = song_beat_times
+        search_times = song_beats
 
-    vid_env = _low_freq_onset_strength(vid_y, sr, hop=hop)
-    song_env = _low_freq_onset_strength(song_y, sr, hop=hop)
+    vid_env = _retime(vid_feat['low_env'], vid_rate)
+    song_env = _retime(song_feat['low_env'], song_rate)
     vid_env = vid_env / (np.max(vid_env) + 1e-9)
     song_env = song_env / (np.max(song_env) + 1e-9)
-    vid_frames, song_frames = len(vid_env), len(song_env)
-    best_score, best_offset_sec = -np.inf, 0.0
+    nv, ns = len(vid_env), len(song_env)
+    corr = correlate(song_env, vid_env, mode='full', method='fft')     # corr[L+nv-1] = Σ song[i+L]·vid[i]
 
+    cands = []
+    min_overlap = 0.5 * min(nv, ns)
     for sb_time in search_times:
         offset_sec = float(sb_time) - vid_first_downbeat
-        if offset_sec < 0 or offset_sec + vid_duration > song_duration:
+        if offset_sec < 0:
             continue
-        start_frame = int(offset_sec * sr / hop)
-        segment = song_env[start_frame:start_frame + vid_frames]
-        if len(segment) < vid_frames:
+        lag = int(offset_sec * sr / hop)
+        ov = min(nv, ns - lag)
+        if ov <= 0 or ov < min_overlap:
             continue
-        score = float(np.dot(vid_env, segment)) + 0.2 * float(np.sum(np.sort(segment)[-max(1, vid_frames // 20):]))
+        cands.append((lag + nv <= ns, offset_sec, lag, ov))
+    pool = [c for c in cands if c[0]]                   # offsets where the whole video fits
+    if not pool and cands:
+        # Video longer than what is left of the song: start the song at its first
+        # usable downbeat so as much of it as possible is used (used to give offset 0
+        # with no beat alignment at all).
+        pool = [min(cands, key=lambda c: c[1])]
+
+    best_score, best_offset_sec = -np.inf, 0.0
+    for _, offset_sec, lag, ov in pool:
+        seg = song_env[lag:lag + ov]
+        k = max(1, ov // 20)
+        score = float(corr[lag + nv - 1]) + 0.2 * float(np.sum(np.partition(seg, len(seg) - k)[-k:]))
         if score > best_score:
             best_score, best_offset_sec = score, offset_sec
 
-    if best_offset_sec > 0 and len(song_beat_times) > 1:
-        nearest = float(song_beat_times[np.argmin(np.abs(song_beat_times - best_offset_sec))])
-        if abs(nearest - best_offset_sec) < float(np.median(np.diff(song_beat_times))) * 0.5:
-            best_offset_sec = nearest
+    # (Older versions snapped the offset itself to the nearest song beat. That put a
+    # song beat at video time 0 rather than on the video's beat — up to half a beat
+    # off. Every candidate is already song downbeat − video downbeat, so it is on-beat.)
 
-    # Fine-tune ±50 ms by cross-correlating onset envelopes
-    best_offset_samp = int(best_offset_sec * sr)
-    fine = int(0.05 * sr)
-    if best_offset_samp > fine and len(vid_y) > sr:
-        vid_oenv = librosa.onset.onset_strength(y=vid_y, sr=sr, hop_length=hop)
-        seg_start = max(0, best_offset_samp - fine)
-        seg_end = min(len(song_y), best_offset_samp + len(vid_y) + fine)
-        if seg_end > seg_start + sr:
-            song_oenv = librosa.onset.onset_strength(y=song_y[seg_start:seg_end], sr=sr, hop_length=hop)
-            if len(song_oenv) > len(vid_oenv):
-                corr = np.correlate(song_oenv, vid_oenv, mode='valid')
-                if len(corr):
-                    refined = seg_start + int(np.argmax(corr)) * hop
-                    if abs(refined - best_offset_samp) <= fine:
-                        best_offset_samp = refined
+    # Fine-tune ±50 ms on the full-band onset envelopes
+    best_offset_samp = int(round(best_offset_sec * sr))
+    vo = _retime(vid_feat['oenv'], vid_rate)
+    so = _retime(song_feat['oenv'], song_rate)
+    base = int(round(best_offset_sec * sr / hop))
+    span = int(round(0.05 * sr / hop))
+    min_frames = sr / hop                                 # at least 1 s of overlap
+    best_d, best_fs = 0, -np.inf
+    for d in range(-span, span + 1):
+        lag = base + d
+        if lag < 0:
+            continue
+        ov = min(len(vo), len(so) - lag)
+        if ov < min_frames:
+            continue
+        s = float(np.dot(vo[:ov], so[lag:lag + ov])) / ov
+        if s > best_fs:
+            best_fs, best_d = s, d
+    best_offset_samp += best_d * hop
 
-    return max(0, best_offset_samp), song_beat_times, np.atleast_1d(song_downbeats), int(song_bpb)
+    return max(0, best_offset_samp), song_beats, song_downbeats, int(song_bpb)
 
 
-def _kick_attacks(y, sr, fc=180.0):
-    """Kick-drum attack times (s) + strengths: rising edge of the low-band log envelope (~1 ms precision)."""
+def _kick_attacks(y, sr, fc=180.0, chunk_sec=CHUNK_SEC):
+    """Kick-drum attack times (s) + strengths: rising edge of the low-band log envelope (~1 ms precision).
+    Chunked with O(N) moving averages, so an hour of audio takes seconds, not minutes."""
     import numpy as np
     from scipy.signal import butter, sosfiltfilt, find_peaks
     sos = butter(4, fc, 'low', fs=sr, output='sos')
-    yl = sosfiltfilt(sos, y)
     hop = max(1, int(sr * 0.001))
     win = max(1, int(sr * 0.010))
-    e = np.sqrt(np.convolve(yl * yl, np.ones(win) / win, mode='same'))[::hop] + 1e-9
+    n = len(y)
+    if n == 0:
+        return np.array([]), np.array([])
+    chunk = max(hop, int(chunk_sec * sr) // hop * hop)
+    pad = (int(sr) // hop + 1) * hop                 # 1 s of filter context on each side
+    h = (win - 1) // 2
+    env = []
+    for a in range(0, n, chunk):
+        b = min(n, a + chunk)
+        s0, s1 = max(0, a - pad), min(n, b + pad)
+        yl = sosfiltfilt(sos, np.asarray(y[s0:s1], dtype=np.float64))
+        c = np.concatenate([[0.0], np.cumsum(yl * yl)])
+        idx = np.arange(a, b, hop) - s0              # same samples as a full-length [::hop]
+        hi = np.minimum(len(yl), idx + h + 1)
+        lo = np.maximum(0, idx + h + 1 - win)
+        env.append(np.sqrt(np.maximum(0.0, (c[hi] - c[lo]) / win)))
+    e = np.concatenate(env) + 1e-9
     db = 20 * np.log10(e / e.max())
     lag = 5
     rise = np.maximum(0, db[lag:] - db[:-lag])
@@ -844,6 +1044,48 @@ def _kick_attacks(y, sr, fc=180.0):
         return np.array([]), np.array([])
     pk, _ = find_peaks(rise, height=0.3 * rise.max(), distance=60)
     return (pk + lag / 2) * hop / sr + 0.0063, rise[pk]
+
+
+def _precise_period(y, sr, period, span=0.012, min_conc=0.4):
+    """
+    Refine a beat period to sub-millisecond precision: the period at which the
+    kick attacks line up best (circular concentration), searched within ±span.
+    Precision grows with the length of the track, which is what long videos need.
+    Returns None when there is no clear kick pulse (then the tracker's tempo stays).
+    """
+    import numpy as np
+    t, w = _kick_attacks(y, sr)
+    if len(t) < 16 or w.sum() <= 0 or t[-1] - t[0] < 8 * period:
+        return None
+    t = t - t[0]
+    T = float(t[-1])
+    # peak width ≈ period² / T, so sample it at ~1/8 of that
+    step = max(period * period / T / 8, 1e-7)
+    grid = np.arange(period * (1 - span), period * (1 + span), step)
+    if len(grid) > 4000:
+        grid = np.linspace(period * (1 - span), period * (1 + span), 4000)
+    conc = np.empty(len(grid))
+    for i in range(0, len(grid), 256):            # bounded memory for very long tracks
+        g = grid[i:i + 256]
+        conc[i:i + len(g)] = np.abs(np.exp(2j * np.pi * t[None, :] / g[:, None]) @ w) / w.sum()
+    k = int(np.argmax(conc))
+    if conc[k] < min_conc or k == 0 or k == len(grid) - 1:
+        return None
+    p = float(grid[k])
+    # Off-beat hits (hats, bass) bias the concentration peak slightly, so finish
+    # with a weighted line fit through the attacks that sit on the pulse.
+    for _ in range(3):
+        z = np.sum(w * np.exp(2j * np.pi * t / p))
+        ph = (np.angle(z) % (2 * np.pi)) * p / (2 * np.pi)
+        idx = np.round((t - ph) / p)
+        near = np.abs(t - ph - idx * p) < 0.1 * p
+        if near.sum() < 16:
+            break
+        slope, _ = np.polyfit(idx[near], t[near], 1, w=np.sqrt(w[near]))
+        if abs(slope - p) > step * 8:
+            break
+        p = float(slope)
+    return p
 
 
 def _attack_phase(y, sr, period):
@@ -906,33 +1148,17 @@ def _bar_phase(downbeats, grid_phase, bi, bpb):
     return (grid_phase + m * bi) % (bi * bpb)
 
 
-def _time_stretch_pair(y_hq, sr_hq, y_lo, sr_lo, rate):
-    """Stretch (rate>1 = faster). Uses Rubber Band for both or librosa for both."""
-    import librosa
-    if CAPS['rubberband']:
-        try:
-            import pyrubberband as pyrb
-            hq = pyrb.time_stretch(y_hq.T if y_hq.ndim == 2 else y_hq, sr_hq, rate)
-            hq = hq.T if y_hq.ndim == 2 else hq
-            lo = pyrb.time_stretch(y_lo, sr_lo, rate)
-            return hq, lo, 'rubberband'
-        except Exception:
-            pass
-    return (librosa.effects.time_stretch(y_hq, rate=rate),
-            librosa.effects.time_stretch(y_lo, rate=rate), 'librosa')
-
-
 def _time_stretch(y, sr, rate):
+    """Stretch (rate>1 = faster), pitch kept. Returns (audio, engine). Rubber Band when available."""
     import librosa
     if CAPS['rubberband']:
         try:
             import pyrubberband as pyrb
             out = pyrb.time_stretch(y.T if y.ndim == 2 else y, sr, rate)
-            return out.T if y.ndim == 2 else out
+            return (out.T if y.ndim == 2 else out), 'rubberband'
         except Exception:
             pass
-    return librosa.effects.time_stretch(y, rate=rate)
-
+    return librosa.effects.time_stretch(y, rate=rate), 'librosa'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Timing helpers
@@ -1127,14 +1353,17 @@ def _build_vf(st, o, out_dur, preview):
     if o['hflip']:
         parts.append('hflip')
     parts += _color_filters(o['filters'])
+    if preview and H > 720:
+        # Downscale BEFORE the beat effects: per-frame zoom / rotate / blur on
+        # 4K frames made previews of heavy videos crawl. Effect sizes scale with W/H.
+        W, H = _even(W * 720 / H), 720
+        parts.append(f'scale={W}:{H}')
     period, phase = _trigger(st, o['fx_division'])
     parts += _beat_effects(o, W, H, period, phase)
     parts += _overlay_filters(o['filters'])
     fo = o['fade_out']
     if fo > 0 and out_dur > fo * 1.5 and (not preview or o['preview_sec'] <= 0 or o['preview_sec'] >= out_dur):
         parts.append(f'fade=t=out:st={out_dur - fo:.3f}:d={fo:.3f}')
-    if preview and H > 720:
-        parts.append('scale=-2:720')
     if parts or preview:
         parts.append('format=yuv420p')
     return ','.join(parts) if parts else None
@@ -1239,7 +1468,7 @@ def _ensure_full_mp3(job_id, st):
         y = y.T
         rate = st['mp3_stretch']
         if st['preserve_pitch']:
-            y = _time_stretch(y, sr, rate)
+            y, _ = _time_stretch(y, sr, rate)
         else:
             y = librosa.resample(y, orig_sr=sr * rate, target_sr=sr)
         peak = float(np.max(np.abs(y))) or 1.0
@@ -1318,18 +1547,23 @@ def _run(job_id, p):
             sr, render_sr = 22050, 44100
             _step(job_id, 'Loading audio...', 20)
             vid_y, _ = librosa.load(vid_audio, sr=sr, mono=True)
-            song_y, _ = librosa.load(song_wav, sr=sr, mono=True)
             song_hq, _ = librosa.load(song_wav, sr=render_sr, mono=False)
+            song_y = librosa.resample(librosa.to_mono(song_hq), orig_sr=render_sr, target_sr=sr)
             if len(vid_y) < sr * 2:
                 raise RuntimeError('Video is too short to detect a beat (needs at least 2 seconds).')
             if vid_info['dur'] <= 0:
                 vid_info['dur'] = len(vid_y) / sr
 
             _step(job_id, 'Detecting video BPM...', 28)
-            vid_tempo, vid_beats, vid_conf, vid_music_start = _detect_bpm(vid_y, sr)
+            vid_feat = _analysis_features(vid_y, sr)
+            _check_cancel(job_id)
+            vid_tempo, vid_beats, vid_conf, vid_music_start, _ = _detect_bpm(vid_y, sr, vid_feat)
             _check_cancel(job_id)
             _step(job_id, 'Detecting song BPM...', 38)
-            song_tempo, _song_beats, song_conf, song_music_start = _detect_bpm(song_y, sr)
+            song_feat = _analysis_features(song_y, sr)
+            _check_cancel(job_id)
+            song_tempo, _, song_conf, song_music_start, song_beats = _detect_bpm(song_y, sr, song_feat)
+            del song_y                       # features hold everything the analysis needs
             _check_cancel(job_id)
             _push(job_id, {'type': 'info', 'vid_music_start': round(vid_music_start / sr, 2),
                            'song_music_start': round(song_music_start / sr, 2)})
@@ -1341,24 +1575,19 @@ def _run(job_id, p):
             if bpm_mode == 'song':
                 video_speed = song_tempo / vid_tempo if vid_tempo > 0 else 1.0
                 _step(job_id, f'Keeping song tempo ({song_tempo:.2f} BPM); video will play at {video_speed:.3f}x...', 46)
-                song_stretched, preserve, resample = song_y, song_hq, song_hq
-                if abs(video_speed - 1.0) > 1e-3:
-                    vid_y_aligned = librosa.effects.time_stretch(vid_y, rate=video_speed)
-                    vid_beats_aligned = vid_beats / video_speed
-                else:
-                    vid_y_aligned, vid_beats_aligned = vid_y, vid_beats
+                preserve = resample = song_hq
                 mp3_stretch = vid_tempo / song_tempo if song_tempo > 0 else 1.0
             else:
                 stretch_ratio = vid_tempo / song_tempo if song_tempo > 0 else 1.0
                 mp3_stretch = 1.0
                 if abs(stretch_ratio - 1.0) <= 1e-3:
                     _step(job_id, 'BPMs already match — no stretch needed...', 46)
-                    song_stretched, preserve, resample = song_y, song_hq, song_hq
+                    preserve = resample = song_hq
                 else:
                     _step(job_id, f'Stretching {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)...', 46)
-                    preserve, song_stretched, engine = _time_stretch_pair(song_hq, render_sr, song_y, sr, stretch_ratio)
+                    preserve, engine = _time_stretch(song_hq, render_sr, stretch_ratio)
+                    _check_cancel(job_id)
                     resample = librosa.resample(song_hq, orig_sr=render_sr * stretch_ratio, target_sr=render_sr)
-                vid_y_aligned, vid_beats_aligned = vid_y, vid_beats
             _check_cancel(job_id)
 
             target_tempo = song_tempo if bpm_mode == 'song' else vid_tempo
@@ -1372,8 +1601,12 @@ def _run(job_id, p):
                                                       'check the preview and nudge if needed.'})
 
             _step(job_id, 'Finding beat-aligned match point...', 56)
+            # The stretch / speed-up is applied to the analysis by re-timing the
+            # features, not by stretching and re-analysing the audio.
             best_off, song_beat_grid, song_downbeats, song_bpb = _find_beat_offset(
-                vid_y_aligned, song_stretched, vid_beats_aligned, sr)
+                vid_feat, song_feat, vid_beats, song_beats, sr,
+                vid_rate=video_speed or 1.0, song_rate=stretch_ratio)
+            del vid_feat, song_feat
             _check_cancel(job_id)
 
             _step(job_id, 'Locking beat grid to the kick drum...', 60)
@@ -1430,7 +1663,7 @@ def _run(job_id, p):
                               'resample': _bar_phase(song_downbeats, gp_resample, bi, bpb)},
                 'micro_align_ms': round(micro_ms, 1),
                 'song_beat_times': [round(float(x), 4) for x in song_beat_grid],
-                'song_duration': round(len(song_stretched) / sr, 2),
+                'song_duration': round(preserve.shape[-1] / render_sr, 2),
                 'video_speed': video_speed, 'bpm_mode': bpm_mode, 'stretch_ratio': stretch_ratio,
                 'mp3_stretch': mp3_stretch, 'opts': p['opts'],
             }
@@ -1637,7 +1870,16 @@ def api_upload():
         return jsonify({'error': f'Unsupported file type: {ext or "unknown"}'}), 400
     tmp = _mkdtemp('beatsync_up_')
     dest = os.path.join(tmp, fname)
-    f.save(dest)
+    spool = getattr(f.stream, 'name', None)
+    if isinstance(spool, str) and os.path.isfile(spool):
+        f.stream.close()
+        try:
+            os.replace(spool, dest)
+        except OSError:                          # different drive: copy, then drop the spool
+            shutil.copyfile(spool, dest)
+            os.remove(spool)
+    else:
+        f.save(dest)
     file_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[file_id] = {'kind': 'upload', 'path': dest, 'tmp': tmp, 'ext': ext, 'created_at': time.time()}
@@ -1856,7 +2098,7 @@ def api_bpm():
         import librosa
         audio = _dl_audio(url, tmp, 'bpm_check')
         y, sr = librosa.load(audio, sr=22050, mono=True)
-        bpm, _, confidence, music_start = _detect_bpm(y, sr)
+        bpm, _, confidence, music_start, _ = _detect_bpm(y, sr)
         return jsonify({'bpm': bpm, 'confidence': confidence, 'music_starts_at': round(music_start / sr, 2)})
     except Exception as e:
         return jsonify({'error': _friendly(e)}), 500
