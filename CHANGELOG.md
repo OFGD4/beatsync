@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.2.2
+
+**Fixed**
+- Download said "not found" after matching another video, until a nudge or setting change.
+  A download now always works: if the finished file is missing, the app serves the newest
+  finished version or quietly rebuilds it (same result, usually a few seconds).
+- Starting a new match now clears the old download buttons, so the old (deleted) session can
+  never be requested, and a late change from the old session can't replace the new one.
+- The app window can no longer open a download link by itself (which showed an error page).
+- Clearer messages: "Still exporting…" while the export runs, and "This session has expired"
+  when it really has.
+
+**Changed**
+- Saving never asks to replace an earlier file: the Save-as dialog suggests
+  `syncedVid (1).mp4`, `syncedVid (2).mp4` … when the name is taken, and opens in the folder
+  you saved to last.
+
 ## 3.2.1
 
 Much faster with big video files, with the same beat analysis as 3.2.0 and no loss of quality.

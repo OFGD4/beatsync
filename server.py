@@ -29,6 +29,7 @@ import math
 import shutil
 import tempfile
 import hashlib
+import logging
 import collections
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -2492,13 +2493,74 @@ def api_progress(job_id):
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
-def _done_job(job_id):
+def _has_outputs(j):
+    p = j.get('file_mp4')
+    return bool(p and os.path.exists(p) and j.get('synced_wav') and os.path.exists(j['synced_wav']))
+
+
+def _download_job(job_id):
+    """The finished job to download for `job_id`.
+    If its files are gone (cleaned up as old, or removed by Windows / antivirus), the newest
+    finished job of the same session that still has them is used — that is what the preview
+    shows. Otherwise the job itself is returned and its files are rebuilt on demand."""
     with jobs_lock:
         j = jobs.get(job_id)
-    if not j or j.get('status') != 'done':
-        return None
+        if not j or j.get('kind') == 'upload':
+            raise FileNotFoundError('This session has expired — press Match Beats again.')
+        root = j.get('root_id')
+        if j.get('status') != 'done' or not _has_outputs(j):
+            done = [(o['created_at'], jid) for jid, o in jobs.items()
+                    if o.get('root_id') == root and o.get('status') == 'done' and _has_outputs(o)]
+            if done:
+                job_id = max(done)[1]
+                j = jobs[job_id]
+        if j.get('status') != 'done':
+            raise FileNotFoundError('Still exporting — the buttons light up when it is ready.')
     _touch(job_id)
-    return j
+    return job_id, j
+
+
+_rebuild_locks = collections.defaultdict(threading.Lock)
+
+
+def _rebuild_outputs(job_id, j):
+    """Re-make a finished job's MP4 + synced audio from its saved state (the same work a nudge
+    does, without a nudge). The source, the analysis and the cached video track are kept for the
+    whole session, so this is usually just a quick mux."""
+    with _rebuild_locks[job_id]:
+        if _has_outputs(j):
+            return
+        st = j.get('state')
+        if not st or not os.path.isdir(st.get('root_tmp') or ''):
+            raise FileNotFoundError('This session has expired — press Match Beats again.')
+        o = st['opts']
+        out_dir = j.get('out_dir')
+        if not out_dir or not os.path.isdir(out_dir):
+            out_dir = tempfile.mkdtemp(prefix='redo_', dir=st['root_tmp'])   # removed with the session
+        out_wav = os.path.join(out_dir, 'synced.wav')
+        out_dur = _slice_audio(st, out_wav)
+        vtrack = None
+        e = _export_track(st, o, out_dur)
+        for _ in range(3):
+            if e is None:
+                break
+            e.done.wait()
+            if e.error is None:
+                vtrack = e.path
+                break
+            if not isinstance(e.error, Cancelled):
+                raise e.error
+            e = _export_track(st, o, out_dur)
+        else:
+            raise RuntimeError('Export was interrupted — try the download again.')
+        out_mp4 = os.path.join(out_dir, 'syncedVid.mp4')
+        part = os.path.join(out_dir, 'syncedVid.part.mp4')
+        _mux_final(None, st, o, vtrack, out_wav, part, out_dur, out_dur, False, 0, 0, 'Writing MP4')
+        os.replace(part, out_mp4)
+        with jobs_lock:
+            j.update(out_dir=out_dir, file_mp4=out_mp4, synced_wav=out_wav, out_dur=out_dur,
+                     file_synced_mp3=None)
+        logging.getLogger('beatsync').warning('download: rebuilt missing files for job %s', job_id)
 
 
 DOWNLOAD_NAMES = {'video': 'syncedVid.mp4', 'synced': 'synced_audio.mp3',
@@ -2507,9 +2569,9 @@ DOWNLOAD_NAMES = {'video': 'syncedVid.mp4', 'synced': 'synced_audio.mp3',
 
 def resolve_file(kind, job_id):
     """Return (path, suggested_name) for a finished job's download, building it if needed."""
-    j = _done_job(job_id)
-    if not j:
-        raise FileNotFoundError('Not ready')
+    job_id, j = _download_job(job_id)
+    if kind in ('video', 'synced') and not _has_outputs(j):
+        _rebuild_outputs(job_id, j)
     if kind == 'video':
         path = j.get('file_mp4')
     elif kind == 'full':

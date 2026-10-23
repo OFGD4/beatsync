@@ -909,8 +909,9 @@
     }
 
     if (S.rootJob) postJSON('/api/cleanup', { job_id: S.rootJob }).catch(() => {});
-    closeES();
-    Object.assign(S, { rootJob: null, currentJob: null, doneJob: null, lastGoodJob: null, timing: null, shownTiming: null, timingByJob: {}, phase: 'analysing', pending: null });
+    closeES(); clearTimeout(S.flushTimer);
+    Object.assign(S, { rootJob: null, currentJob: null, doneJob: null, lastGoodJob: null, timing: null, shownTiming: null, timingByJob: {}, phase: 'analysing', pending: null, previewFor: null });
+    resetDownloads();
     $('run-btn').disabled = true; $('run-btn').firstChild.textContent = 'Matching…';
     $('progress').style.display = 'block'; $('prog-spin').style.display = ''; $('warn').style.display = 'none';
     $('studio').style.display = 'none'; $('export').style.display = 'none';
@@ -1038,16 +1039,28 @@
     } else el.textContent = msg || '';
   }
   const DL_KIND = { 'dl-mp4': 'video', 'dl-synced': 'synced', 'dl-full': 'full' };
+  const DL_LABEL = { 'dl-mp4': 'Video MP4', 'dl-synced': 'Synced audio', 'dl-full': 'Full song (BPM-matched)' };
+  // Links are emptied and switched off whenever a new match starts, so an old session's
+  // (already deleted) file can never be requested.
+  function resetDownloads() {
+    Object.keys(DL_KIND).forEach(id => { $(id).classList.add('disabled'); $(id).setAttribute('href', '#'); });
+    $('ex-status').textContent = ''; $('ex-sub').textContent = '';
+    $('saved-line').classList.remove('show'); S.lastSaved = null;
+  }
   Object.keys(DL_KIND).forEach(id => $(id).addEventListener('click', async e => {
-    if (!isDesktop() || $(id).classList.contains('disabled') || !S.doneJob) return;
-    e.preventDefault();
-    const prev = $(id).textContent; $(id).textContent = 'Saving\u2026';
+    const ready = !$(id).classList.contains('disabled') && !!S.doneJob;
+    if (!isDesktop()) { if (!ready) e.preventDefault(); return; }
+    e.preventDefault();                                  // the app window must never open the link itself
+    if (!ready) { toast('Still exporting \u2014 the buttons light up when it is ready'); return; }
+    if (S.saving) return;
+    S.saving = true;
+    $(id).textContent = 'Saving\u2026';
     try {
       const r = await window.pywebview.api.save(DL_KIND[id], S.doneJob);
       if (r && r.ok) { S.lastSaved = r.path; $('saved-path').textContent = 'Saved: ' + r.path; $('saved-line').classList.add('show'); toast('Saved', 'success'); }
       else if (r && r.error) toast(r.error, 'error');
-    } catch (err) { toast(String(err), 'error'); }
-    finally { $(id).textContent = prev; }
+    } catch (err) { toast(String((err && err.message) || err), 'error'); }
+    finally { $(id).textContent = DL_LABEL[id]; S.saving = false; }
   }));
   $('saved-show').addEventListener('click', () => { if (isDesktop() && S.lastSaved) window.pywebview.api.reveal(S.lastSaved); });
 
@@ -1107,14 +1120,20 @@
     if (p.seek_to !== undefined) body.seek_to = p.seek_to;
     if (p.preserve_pitch !== undefined) body.preserve_pitch = p.preserve_pitch;
     if (p.opts) body.opts = S.opts;
+    const root = S.rootJob;
     try {
       const d = await postJSON('/api/adjust', body);
+      if (S.rootJob !== root) {                       // a new match started meanwhile: drop it
+        postJSON('/api/cleanup', { job_id: d.job_id }).catch(() => {});
+        return;
+      }
       S.currentJob = d.job_id;
       S.timing = d.timing; S.timingByJob[d.job_id] = d.timing; renderTiming();
       setStatus('Rendering preview…', 'busy');
       exportStatus('Waiting for preview…', 0);
       listen(d.job_id);
     } catch (e) {
+      if (S.rootJob !== root) return;
       $('overlay').classList.remove('show');
       setStatus('⚠ ' + e.message, 'err');
     }
@@ -1272,6 +1291,7 @@
     if (S.rootJob) postJSON('/api/cleanup', { job_id: S.currentJob || S.rootJob }).catch(() => {});
     closeES(); clearTimeout(S.flushTimer);
     Object.assign(S, { rootJob: null, currentJob: null, doneJob: null, lastGoodJob: null, timing: null, shownTiming: null, timingByJob: {}, phase: 'idle', pending: null, previewFor: null });
+    resetDownloads();
     const v = $('video'); v.pause(); v.removeAttribute('src'); v.load();
     ['progress', 'studio', 'export'].forEach(id => $(id).style.display = 'none');
     ['vid', 'song'].forEach(src => {

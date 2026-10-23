@@ -307,6 +307,31 @@ def warm_up():
 
 # ── JavaScript bridge (window.pywebview.api.* in the page) ───────────────────
 
+def save_folder():
+    """Where the Save-as dialog opens: the last folder used, else Downloads, else home."""
+    last = tools._load_state().get('last_save_dir')
+    for d in (last, Path.home() / 'Downloads', Path.home()):
+        if d and Path(d).is_dir():
+            return Path(d)
+    return None
+
+
+def remember_save_folder(folder):
+    if folder and os.path.isdir(folder):
+        tools._save_state(last_save_dir=str(folder))
+
+
+def free_name(folder, name):
+    """name, or 'stem (1).ext', 'stem (2).ext' … — the first one not already in `folder`
+    (so saving never asks to replace an earlier export)."""
+    stem, ext = os.path.splitext(name)
+    candidate, n = name, 1
+    while (Path(folder) / candidate).exists():
+        candidate = f'{stem} ({n}){ext}'
+        n += 1
+    return candidate
+
+
 def place_file(src, dest):
     """Put a finished file at `dest`. On the same drive this is a hard link: instant and no extra
     disk space, even for a multi-GB export (the temp name is simply removed later). Otherwise —
@@ -349,17 +374,19 @@ class Api:
         return {'name': APP_NAME, 'version': APP_VERSION, 'repo': GITHUB_REPO, 'data_dir': str(DATA)}
 
     def save(self, kind, job_id):
-        """Native Save-as dialog for a finished download."""
+        """Native Save-as dialog for a finished download. The suggested name is never one that
+        already exists in that folder: syncedVid.mp4 → syncedVid (1).mp4 → syncedVid (2).mp4 …"""
         try:
             path, name = self._server.resolve_file(kind, job_id)
         except Exception as e:
+            logging.warning('save %s %s: %s', kind, job_id, e)
             return {'ok': False, 'error': str(e)}
         ext = os.path.splitext(name)[1]
         types = ('Video (*.mp4)',) if ext == '.mp4' else ('MP3 audio (*.mp3)',)
-        downloads = Path.home() / 'Downloads'
+        folder = save_folder()
         dest = self._first(self._window.create_file_dialog(
-            self._dialog('save'), directory=str(downloads) if downloads.is_dir() else '',
-            save_filename=name, file_types=types))
+            self._dialog('save'), directory=str(folder) if folder else '',
+            save_filename=free_name(folder, name) if folder else name, file_types=types))
         if not dest:
             return {'ok': False, 'cancelled': True}
         if not dest.lower().endswith(ext):
@@ -367,7 +394,9 @@ class Api:
         try:
             place_file(path, dest)
         except OSError as e:
+            logging.warning('save to %s failed: %s', dest, e)
             return {'ok': False, 'error': f'Could not save: {e}'}
+        remember_save_folder(os.path.dirname(dest))
         return {'ok': True, 'path': dest}
 
     def pick_file(self, src):
