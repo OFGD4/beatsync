@@ -1,5 +1,7 @@
 """
-BEATSYNC v3 — beat-align any song to any video.
+BEATSYNC engine — beat-align any song to any video.
+
+The desktop app (desktop.py + ui/) calls this JSON API in-process; there is no web page.
 
 Pipeline
   1. /api/start   → analyse both sources, find the beat-aligned offset, stretch,
@@ -2253,18 +2255,6 @@ def _derive(src_id, changes):
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route('/')
-def index():
-    # Served raw (no Jinja) and re-read each time so template edits apply instantly.
-    html = (APP_DIR / 'templates' / 'index.html').read_text(encoding='utf-8')
-    return Response(html, mimetype='text/html')
-
-
-@app.route('/assets/<path:name>')
-def assets(name):
-    return send_from_directory(APP_DIR / 'assets', name, max_age=86400)
-
-
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
     if request.method == 'POST':
@@ -2674,28 +2664,10 @@ def api_bpm():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-@app.route('/bpm')
-def bpm_page():
-    return '''<!doctype html><meta charset="utf-8"><title>BPM check</title>
-    <body style="background:#080810;color:#e0e0f0;font-family:monospace;padding:40px">
-    <input id="url" placeholder="paste url" style="width:400px;padding:8px">
-    <button onclick="check()">Check BPM</button><p id="result"></p>
-    <script>
-    async function check() {
-      const r = document.getElementById('result'); r.textContent = 'Analysing...';
-      const res = await fetch('/api/bpm', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({url: document.getElementById('url').value})});
-      const d = await res.json();
-      r.textContent = d.bpm ? `BPM: ${d.bpm} (confidence: ${(d.confidence*100).toFixed(0)}%) — music starts at ${d.music_starts_at}s`
-                            : 'Error: ' + d.error;
-    }
-    </script>'''
-
-
 def banner(port):
     rt = 'deno' if tools.find('deno') else 'node' if tools.find('node') else None
     print('=' * 60)
-    print(f'  {APP_NAME} {APP_VERSION} — http://localhost:{port}')
+    print(f'  {APP_NAME} {APP_VERSION} engine API — http://localhost:{port}/api/caps')
     print(f'  ffmpeg: {CAPS["ffmpeg_version"] or "NOT FOUND"}   Rubber Band: '
           f'{"yes" if CAPS["rubberband"] else "not found (lower-quality stretch)"}')
     print(f'  yt-dlp: {tools.version("yt-dlp") or "not installed"}   JS runtime for YouTube: '

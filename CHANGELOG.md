@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.3.0
+
+A native app: the window is now built with Qt instead of a web page.
+
+**Changed**
+- No HTML, no browser component and no local web server: the window is native (Qt for Python) and
+  the engine runs inside the app. The Microsoft Edge WebView2 Runtime is no longer needed.
+- Opens compact — 900×620, centred (smaller if the screen is) — and can be maximised.
+- New layout: video, song, match settings and the Match button in a sidebar that is always visible;
+  the preview with Timing / Beat FX / Color / Frame & fade / Export tabs on the right; Download in a
+  bar along the bottom. Mix and Pitch now live in one place and change the result live.
+- Drop a video and a song anywhere in the window — each goes to the right slot.
+- Sessions no longer expire while the window is open.
+- `--selftest` checks a build (engine, window, video playback) and is run by the release workflow.
+
+**Fixed**
+- The preview could go blank after saving a file (a WebView2 issue — gone with the native window).
+
 ## 3.2.4
 
 **Changed**

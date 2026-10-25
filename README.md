@@ -4,7 +4,7 @@ Beat-align any song to any video. It matches the tempo, locks the song's kick dr
 and adds beat-synced effects, color grading and export options.
 The video slot also takes an audio file (MP3, WAV, …) to match one track to another.
 
-Runs as a **Windows desktop app**, or as a local web app in your browser.
+A native **Windows desktop app** (Qt) — no browser component, no web page.
 
 ### ⬇ [Download BeatSync for Windows](https://github.com/YOUR_GITHUB_USERNAME/beatsync/releases/latest/download/BeatSync-Setup.exe)
 
@@ -23,8 +23,10 @@ Windows 10/11 · free · no admin rights needed
 Windows may show "Windows protected your PC" because the app isn't code-signed yet.
 Click **More info → Run anyway**.
 
-**Big files:** click the drop box to pick a file. The app reads it where it is, with no upload
-or copy. Dragging a file in still works, but it copies the file first.
+**Files:** pick a video and a song with the File buttons, or drop them anywhere in the window. They are
+read where they are (no upload, no copy), so even multi-GB videos are ready instantly.
+
+**Window:** opens at a compact 900×620 in the middle of the screen. Maximise it for a bigger preview.
 
 ### Where things live
 
@@ -41,8 +43,6 @@ or copy. Dragging a file in still works, but it copies the file first.
 2. Run `BeatSync.exe --debug` from a terminal. A console window shows what happens during startup.
 3. Send `%LOCALAPPDATA%\BeatSync\logs\beatsync.log` along with your bug report.
 
-If the window never appears, the Microsoft Edge WebView2 Runtime is usually missing. BeatSync then offers
-to open Microsoft's download page.
 
 ---
 
@@ -51,11 +51,11 @@ to open Microsoft's download page.
 ```bat
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements-desktop.txt
-.venv\Scripts\python desktop.py            REM desktop window
-.venv\Scripts\python desktop.py --headless REM engine only → http://127.0.0.1:5002
+.venv\Scripts\python desktop.py              REM the app
+.venv\Scripts\python desktop.py --selftest   REM check the engine, the window and video playback
 ```
 
-The browser-only version still works: `pip install -r requirements.txt`, then `python server.py`.
+`ui/` is the window (Qt for Python); `server.py` is the engine, which the window calls in-process.
 
 ---
 

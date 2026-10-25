@@ -46,7 +46,7 @@ def app_dir() -> Path:
 
 
 def resource_dir() -> Path:
-    """Read-only resources (templates, assets). Inside the bundle when frozen."""
+    """Read-only resources (assets: fonts, icons). Inside the bundle when frozen."""
     return Path(getattr(sys, '_MEIPASS', app_dir()))
 
 

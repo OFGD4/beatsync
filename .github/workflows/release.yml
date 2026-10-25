@@ -43,17 +43,12 @@ jobs:
         shell: pwsh
         run: if (Test-Path build/bin) { Copy-Item build/bin dist/BeatSync/bin -Recurse -Force }
 
-      - name: Smoke test (engine starts and answers)
+      - name: Smoke test (engine + window + video playback support)
         shell: pwsh
         run: |
-          $p = Start-Process dist/BeatSync/BeatSync.exe -ArgumentList '--headless', '--port', '5199' -PassThru
-          $ok = $false
-          foreach ($i in 1..30) {
-            Start-Sleep 2
-            try { if ((Invoke-WebRequest http://127.0.0.1:5199/api/caps -UseBasicParsing).StatusCode -eq 200) { $ok = $true; break } } catch {}
-          }
-          Stop-Process $p.Id -Force
-          if (-not $ok) { Get-Content "$env:LOCALAPPDATA/BeatSync/logs/beatsync.log" -ErrorAction SilentlyContinue; exit 1 }
+          $p = Start-Process dist/BeatSync/BeatSync.exe -ArgumentList '--selftest' -PassThru -Wait
+          Get-Content "$env:LOCALAPPDATA/BeatSync/logs/beatsync.log" -Tail 20 -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { exit 1 }
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
