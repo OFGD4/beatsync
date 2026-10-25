@@ -361,7 +361,12 @@ def _prune(job_id, keep_last_done):
         if not me:
             return
         root = me['root_id']
-        others = [(jid, j) for jid, j in jobs.items() if j.get('root_id') == root and jid != job_id]
+        # Only renders made *before* this one. The prune runs a few seconds late, and by then a
+        # newer change may already be finished — its preview and downloads must never be deleted
+        # (that left the preview blank and made downloads rebuild after quick changes).
+        mine = me.get('created_at', 0)
+        others = [(jid, j) for jid, j in jobs.items()
+                  if j.get('root_id') == root and jid != job_id and j.get('created_at', 0) <= mine]
         last_done = None
         if keep_last_done:
             done = [(j['created_at'], jid) for jid, j in others if j.get('status') == 'done' and j.get('out_dir')]
@@ -1391,6 +1396,7 @@ def _timing(st):
         'speed': sp,
         'micro_align_ms': st.get('micro_align_ms', 0.0),
         'song_duration': st['song_duration'],
+        'base_duration': round(st['vid_info']['dur'] / (st.get('video_speed') or 1.0), 3),   # length at 1×
         'preserve_pitch': st['preserve_pitch'],
         'bpm_mode': st['bpm_mode'],
         'target_bpm': round(60.0 / bi * sp, 3),
@@ -2157,7 +2163,7 @@ def _run(job_id, p):
                     _step(job_id, f'BPMs already match{mult_note} — no stretch needed...', 46)
                     preserve = resample = song_hq
                 else:
-                    _step(job_id, f'Stretching {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)'
+                    _step(job_id, f'Stretching the song {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)'
                                   f'{mult_note}...', 46)
                     with ThreadPoolExecutor(1) as ex:    # the turntable version is made alongside
                         f_res = ex.submit(librosa.resample, song_hq, orig_sr=render_sr * stretch_ratio,
@@ -2355,6 +2361,31 @@ def _derive(src_id, changes):
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    # Served raw (no Jinja) and re-read each time so template edits apply instantly.
+    html = (APP_DIR / 'templates' / 'index.html').read_text(encoding='utf-8')
+    resp = Response(html, mimetype='text/html')
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route('/assets/<path:name>')
+def assets(name):
+    return send_from_directory(APP_DIR / 'assets', name, max_age=86400)
+
+
+@app.route('/api/touch', methods=['POST'])
+def api_touch():
+    """Keep-alive from the open window, so a session never expires while someone is editing."""
+    job_id = ((request.json or {}).get('job_id') or '').strip()
+    with jobs_lock:
+        known = job_id in jobs
+    if known:
+        _touch(job_id)
+    return jsonify({'ok': known})
+
 
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
@@ -2821,7 +2852,7 @@ def api_bpm():
 def banner(port):
     rt = 'deno' if tools.find('deno') else 'node' if tools.find('node') else None
     print('=' * 60)
-    print(f'  {APP_NAME} {APP_VERSION} engine API — http://localhost:{port}/api/caps')
+    print(f'  {APP_NAME} {APP_VERSION} — http://localhost:{port}')
     print(f'  ffmpeg: {CAPS["ffmpeg_version"] or "NOT FOUND"}   Rubber Band: '
           f'{"yes" if CAPS["rubberband"] else "not found (lower-quality stretch)"}')
     print(f'  yt-dlp: {tools.version("yt-dlp") or "not installed"}   JS runtime for YouTube: '

@@ -1,5 +1,4 @@
-# Desktop app build (Windows). The window is native Qt — no browser component.
-# yt-dlp, ffmpeg and Deno are NOT Python packages here:
+# Desktop app build (Windows). yt-dlp, ffmpeg and Deno are NOT Python packages here:
 # the app downloads their standalone programs on first run so they can self-update.
 flask>=3.0
 flask-cors
@@ -8,5 +7,5 @@ soundfile
 numpy
 scipy>=1.15          # fast 1-D median filter (HPSS ~5x faster)
 pyrubberband
-PySide6>=6.8,<7      # native window + video preview (Qt for Python, LGPL)
+pywebview>=5.0
 pyinstaller>=6.10

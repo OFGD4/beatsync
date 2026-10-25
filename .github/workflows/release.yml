@@ -43,7 +43,7 @@ jobs:
         shell: pwsh
         run: if (Test-Path build/bin) { Copy-Item build/bin dist/BeatSync/bin -Recurse -Force }
 
-      - name: Smoke test (engine + window + video playback support)
+      - name: Smoke test (engine, page and window component)
         shell: pwsh
         run: |
           $p = Start-Process dist/BeatSync/BeatSync.exe -ArgumentList '--selftest' -PassThru -Wait

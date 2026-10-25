@@ -2,7 +2,7 @@
 ; Per-user install (no admin rights needed) into %LOCALAPPDATA%\Programs\BeatSync.
 
 #ifndef AppVersion
-  #define AppVersion "3.6.0"
+  #define AppVersion "3.7.0"
 #endif
 #define AppName "BeatSync"
 #define AppExe "BeatSync.exe"
@@ -59,6 +59,18 @@ Filename: "{app}\{#AppExe}"; Description: "Start BeatSync"; Flags: nowait postin
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+const
+  WebView2Key = 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+
+function HasWebView2(): Boolean;
+var
+  V: String;
+begin
+  Result := (RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', V) and (V <> '') and (V <> '0.0.0.0'))
+         or (RegQueryStringValue(HKLM, WebView2Key, 'pv', V) and (V <> '') and (V <> '0.0.0.0'))
+         or (RegQueryStringValue(HKCU, WebView2Key, 'pv', V) and (V <> '') and (V <> '0.0.0.0'));
+end;
+
 procedure KillBeatSync();
 var
   ResultCode: Integer;
@@ -71,6 +83,16 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   KillBeatSync();
   Result := '';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  if (CurStep = ssPostInstall) and (not HasWebView2()) then
+    if MsgBox('BeatSync needs the Microsoft Edge WebView2 Runtime (free, from Microsoft), which was not found.' + #13#10#13#10 +
+              'Open the download page now?', mbConfirmation, MB_YESNO) = IDYES then
+      ShellExec('open', 'https://go.microsoft.com/fwlink/p/?LinkId=2124703', '', '', SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

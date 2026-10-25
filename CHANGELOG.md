@@ -1,8 +1,27 @@
 # Changelog
 
+## 3.7.0
+
+**Changed**
+- **The window is HTML again** (WebView2), restyled as a desktop app: sources and match settings on the
+  left, preview and controls on the right, download bar at the bottom. Nothing scrolls as a page; it opens
+  at 900×620 and fills the screen when maximised. Everything else stays as it was: Speed tab, Song beat
+  (Auto / ½× / 1× / 2× / ⋯), pitch toggle in the studio, player controls with playback speed, sliders that
+  jump to a click.
+- **Full screen** really fills the screen (the window goes full screen), with the same controls.
+- **Dropping files** on the window uses them where they are — no copy, also for big videos.
+
+**Fixed**
+- **Preview going blank / downloads rebuilding after quick changes.** Each change cleans up older renders a
+  few seconds later; that cleanup could delete a *newer* change that had already finished. The preview then
+  disappeared (for example after saving a download) until the next change. Only older renders are removed now.
+
 ## 3.6.0
 
 **Changed**
+- **Smoother preview:** the video is now drawn by the graphics card (like a browser does), so playback
+  stays smooth even full screen. The controls still float over the picture. If the graphics card path
+  can't start, BeatSync switches to the previous CPU player by itself (`BeatSync.exe --cpu-video` forces it).
 - **Sliders:** click anywhere on a slider's track and the knob jumps there (and you can keep dragging).
   Before, only dragging the knob itself moved it.
 - **Song beat:** Auto is now the default — half, normal or double time (also ¼× and 4×), whichever

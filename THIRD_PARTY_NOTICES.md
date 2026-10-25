@@ -30,16 +30,17 @@ It uses or downloads the following software. Each item keeps its own license.
 | python-soxr / libsoxr | LGPL-2.1 or later |
 | audioread, platformdirs, flask-cors | MIT |
 | Flask, Werkzeug, Jinja2, MarkupSafe, itsdangerous, click, blinker | BSD-3-Clause |
-| Qt for Python (PySide6, shiboken6) and the Qt libraries it ships | LGPL-3.0 (qt.io/licensing) |
-| FFmpeg libraries used by Qt Multimedia for the preview player | LGPL-2.1 or later |
+| pywebview | BSD-3-Clause |
+| pythonnet, clr_loader | MIT |
+| Microsoft Edge WebView2 SDK files (redistributable) | Microsoft Software License Terms |
 | PyInstaller bootloader | GPL v2 with the PyInstaller bootloader exception |
 
 ## Fonts
 
 | Font | License |
 |---|---|
-| Bebas Neue | SIL Open Font License 1.1 (`assets/fonts/OFL-BebasNeue.txt`), shipped as TTF |
-| DM Mono | SIL Open Font License 1.1 (`assets/fonts/OFL-DMMono.txt`), shipped as TTF |
+| Bebas Neue | SIL Open Font License 1.1 (`assets/fonts/OFL-BebasNeue.txt`) |
+| DM Mono | SIL Open Font License 1.1 (`assets/fonts/OFL-DMMono.txt`) |
 
 ## Note on online content
 
