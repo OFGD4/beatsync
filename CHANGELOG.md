@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.4.0
+
+**New**
+- **Speed tab** (next to Timing and Beat FX): change the speed of the exported video — any value from
+  0.25× to 4×, typed or dragged. Picture, song and the video's own sound speed up or slow down together
+  and stay on the beat; beat effects, the beat LEDs and the BPM follow. The Synced audio and Full song
+  downloads use the same speed. A nudge at any speed is as fast as at 1×.
+- **Pitch switch in the studio** (Speed tab, and still in the sidebar — they are the same setting):
+  locked keeps the song's key at any speed; off lets pitch follow speed like a turntable.
+- **Player controls on the video**, like a browser player but native: play / pause, seek, time,
+  playback speed and full screen. A round play button shows on a paused video. Click to play / pause,
+  double-click for full screen. The controls hide while playing and come back when you move the mouse.
+- **Full screen** with the same controls (Esc or F to leave, ← / → to skip 5 s, Space to play / pause).
+- **Playback speed** (0.25× – 2× or any custom value) for watching the preview only — it is never
+  exported. The key is kept where Qt supports it.
+
+**Fixed**
+- The preview's sound stayed on the device that was the default when BeatSync opened (e.g. the monitor)
+  after switching Windows to headphones. It now follows the Windows default output device.
+
 ## 3.3.0
 
 A native app: the window is now built with Qt instead of a web page.

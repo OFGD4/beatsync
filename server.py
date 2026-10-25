@@ -200,6 +200,7 @@ def _default_opts():
         'fade_out': 0.0,
         'quality': 'balanced',
         'preview_sec': 15,
+        'speed': 1.0,                 # export speed of the whole result (video + song), any value 0.25–4
     }
 
 
@@ -245,7 +246,21 @@ def _clean_opts(raw, base=None):
         o['quality'] = raw['quality']
     if 'preview_sec' in raw:
         o['preview_sec'] = int(_clamp(raw['preview_sec'], 0, 120, 15))
+    if 'speed' in raw:
+        o['speed'] = round(_clamp(raw['speed'], SPEED_MIN, SPEED_MAX, 1.0), 4)
     return o
+
+
+SPEED_MIN, SPEED_MAX = 0.25, 4.0
+
+
+def _out_speed(o):
+    """Export speed chosen in the Speed tab (1.0 = unchanged)."""
+    try:
+        sp = float((o or {}).get('speed', 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return 1.0 if abs(sp - 1.0) < 1e-4 else sp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1356,25 +1371,29 @@ def _pitch_val(st, key):
 
 
 def _timing(st):
+    """Offsets are in song time; beat interval / phases / BPM are in *output* time, so with an
+    export speed they describe the result as it plays (effects, preview LEDs, the BPM shown)."""
     sr = st['render_sr']
     bi = st['beat_interval']
     bpb = _bpb(st)
     off = st['offset_samples'] / sr
     auto = st['auto_offset_samples'] / sr
+    sp = _out_speed(st.get('opts'))
     return {
         'offset': round(off, 4),
         'auto_offset': round(auto, 4),
         'delta_ms': round((off - auto) * 1000, 1),
         'delta_beats': round((off - auto) / bi, 3),
-        'beat_interval': round(bi, 6),
+        'beat_interval': round(bi / sp, 6),
         'beats_per_bar': bpb,
-        'beat_phase_out': round((_pitch_val(st, 'grid_phase') - off) % bi, 5),
-        'bar_phase_out': round((_pitch_val(st, 'bar_phase') - off) % (bi * bpb), 5),
+        'beat_phase_out': round(((_pitch_val(st, 'grid_phase') - off) % bi) / sp, 5),
+        'bar_phase_out': round(((_pitch_val(st, 'bar_phase') - off) % (bi * bpb)) / sp, 5),
+        'speed': sp,
         'micro_align_ms': st.get('micro_align_ms', 0.0),
         'song_duration': st['song_duration'],
         'preserve_pitch': st['preserve_pitch'],
         'bpm_mode': st['bpm_mode'],
-        'target_bpm': round(60.0 / bi, 3),
+        'target_bpm': round(60.0 / bi * sp, 3),
     }
 
 
@@ -1514,7 +1533,7 @@ def _build_vf(st, o, out_dur, preview):
     vi = st['vid_info']
     W, H = _even(vi['w']), _even(vi['h'])
     parts = []
-    vs = st.get('video_speed') or 1.0
+    vs = (st.get('video_speed') or 1.0) * _out_speed(o)      # Match Song speed × export speed
     if abs(vs - 1.0) > 1e-3:
         parts.append(f'setpts=PTS/{vs:.6f}')
         # Re-grid to the source frame rate by timestamp. Without this the muxer
@@ -1574,7 +1593,16 @@ def _audio_graph(st, o, out_dur, fade_ok=True, orig='0:a:0', song='1:a:0'):
     if mixing:
         k = 1.0 if CAPS['amix_normalize'] else 2.0      # old ffmpeg: amix halves each input
         vs = st.get('video_speed') or 1.0
-        at = (_build_atempo(vs) + ',') if abs(vs - 1.0) > 1e-3 else ''   # keep original audio in sync with sped video
+        sp = _out_speed(o)
+        chain = []                                   # keep original audio in sync with the sped video
+        if st.get('preserve_pitch', True) or sp == 1.0:
+            if abs(vs * sp - 1.0) > 1e-3:
+                chain.append(_build_atempo(vs * sp))
+        else:                                        # export speed like a turntable: pitch follows
+            if abs(vs - 1.0) > 1e-3:
+                chain.append(_build_atempo(vs))
+            chain.append(f'aresample=48000,asetrate={48000 * sp:.2f},aresample=48000')
+        at = (','.join(chain) + ',') if chain else ''
         norm = ':normalize=0' if CAPS['amix_normalize'] else ''
         return ([f'[{orig}]{at}aformat=channel_layouts=stereo,volume={orig_vol * k:.4f}[oa]',
                  f'[{song}]aformat=channel_layouts=stereo,volume={new_vol * k:.4f}[na]',
@@ -1836,16 +1864,67 @@ def _mux_final(job_id, st, o, vtrack, wav, out_path, out_dur, t_lim, preview, p0
 # Render (shared by the first run and every adjustment)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _slice_audio(st, out_wav):
-    """Cut the song at the current offset. Negative offset = song starts late (silence first)."""
+_speed_locks = collections.defaultdict(threading.Lock)
+
+
+def _speed_full(st, sp):
+    """The whole matched song at export speed `sp` (pitch kept or following, as chosen), made
+    once per speed and pitch mode and cached in the session, so later nudges cost nothing extra."""
     import numpy as np
     import soundfile as sf
-    full = st['full_preserve_wav'] if st['preserve_pitch'] else st['full_resample_wav']
+    key = 'preserve' if st['preserve_pitch'] else 'resample'
+    base = st['full_preserve_wav'] if st['preserve_pitch'] else st['full_resample_wav']
+    path = os.path.join(st['root_tmp'], f'speed_{key}_x{sp:.4f}.wav')
+    with _speed_locks[path]:
+        if os.path.exists(path):
+            return path
+        y, sr = sf.read(base, always_2d=True)
+        y = y.T
+        if st['preserve_pitch']:
+            y, _ = _time_stretch(y, sr, sp)
+        else:
+            import librosa
+            y = librosa.resample(y, orig_sr=sr * sp, target_sr=sr)
+        peak = float(np.max(np.abs(y))) or 1.0
+        part = path + '.part.wav'
+        sf.write(part, (y / peak * 0.9).T, sr)
+        os.replace(part, path)
+    # keep only the newest few speeds on disk
+    try:
+        d = st['root_tmp']
+        olds = sorted((os.path.join(d, n) for n in os.listdir(d) if n.startswith('speed_') and n.endswith('.wav')
+                       and '.part' not in n), key=os.path.getmtime, reverse=True)
+        for f in olds[4:]:
+            if f != path:
+                os.remove(f)
+    except OSError:
+        pass
+    return path
+
+
+def _speed_ready(st):
+    sp = _out_speed(st.get('opts'))
+    if sp == 1.0:
+        return True
+    key = 'preserve' if st['preserve_pitch'] else 'resample'
+    return os.path.exists(os.path.join(st['root_tmp'], f'speed_{key}_x{sp:.4f}.wav'))
+
+
+def _slice_audio(st, out_wav):
+    """Cut the song at the current offset. Negative offset = song starts late (silence first).
+    With an export speed the cut comes from the sped-up/slowed-down copy of the song."""
+    import numpy as np
+    import soundfile as sf
+    sp = _out_speed(st.get('opts'))
+    if sp == 1.0:
+        full = st['full_preserve_wav'] if st['preserve_pitch'] else st['full_resample_wav']
+    else:
+        full = _speed_full(st, sp)
     sr = st['render_sr']
     vs = st.get('video_speed') or 1.0
-    vid_out_dur = st['vid_info']['dur'] / vs
+    vid_out_dur = st['vid_info']['dur'] / vs / sp
     need = int((vid_out_dur + 0.5) * sr)
-    off = int(st['offset_samples'])
+    off = int(round(st['offset_samples'] / sp))
     total = sf.info(full).frames
     start, pad = max(0, off), max(0, -off)
     stop = min(total, start + max(0, need - pad))
@@ -1864,7 +1943,8 @@ def _ensure_full_mp3(job_id, st):
     No longer built before every export: it is made in the background after the export, or on
     demand when downloaded."""
     key = 'preserve' if st['preserve_pitch'] else 'resample'
-    path = os.path.join(st['root_tmp'], f'full_song_{key}.mp3')
+    sp = _out_speed(st.get('opts'))
+    path = os.path.join(st['root_tmp'], f'full_song_{key}' + (f'_x{sp:.4f}' if sp != 1.0 else '') + '.mp3')
     with _full_mp3_locks[path]:
         if os.path.exists(path):
             return path
@@ -1884,18 +1964,21 @@ def _build_full_mp3(job_id, st, key, path):
     import numpy as np
     import soundfile as sf
     src = st['full_preserve_wav'] if st['preserve_pitch'] else st['full_resample_wav']
-    if st['bpm_mode'] == 'song' and abs(st['mp3_stretch'] - 1.0) > 1e-3:
+    sp = _out_speed(st.get('opts'))
+    if st['bpm_mode'] == 'song' and abs(st['mp3_stretch'] * sp - 1.0) > 1e-3:
         import librosa
         y, sr = sf.read(st['full_preserve_wav'], always_2d=True)
         y = y.T
-        rate = st['mp3_stretch']
+        rate = st['mp3_stretch'] * sp
         if st['preserve_pitch']:
             y, _ = _time_stretch(y, sr, rate)
         else:
             y = librosa.resample(y, orig_sr=sr * rate, target_sr=sr)
         peak = float(np.max(np.abs(y))) or 1.0
-        src = os.path.join(st['root_tmp'], f'full_song_{key}.wav')
+        src = os.path.join(st['root_tmp'], f'full_song_{key}_x{sp:.4f}.wav')
         sf.write(src, (y / peak * 0.9).T, sr)
+    elif sp != 1.0:
+        src = _speed_full(st, sp)
     tmp_path = path + '.part.mp3'
     _ffmpeg(job_id, ['-i', src, '-codec:a', 'libmp3lame', '-b:a', '320k', tmp_path])
     os.replace(tmp_path, path)
@@ -1906,7 +1989,10 @@ def _render(job_id, st, out_dir, p_start=5):
     _check_cancel(job_id)
     o = st['opts']
     out_wav = os.path.join(out_dir, 'synced.wav')
+    if not _speed_ready(st):
+        _step(job_id, f'Changing the speed to {_out_speed(o):g}x…', p_start)
     out_dur = _slice_audio(st, out_wav)
+    _check_cancel(job_id)
     if out_dur < 0.5:
         raise RuntimeError('Not enough song left after this offset — nudge back or reset.')
     timing = _timing(st)
@@ -2003,7 +2089,7 @@ def _run(job_id, p):
             # When the export picture can't depend on the analysis (Match Video tempo, no beat
             # effects), start encoding it now, in the background, while the audio is analysed.
             opts = p['opts']
-            if p['bpm_mode'] == 'video' and not opts['effects'] and vid_info['dur'] > 0:
+            if p['bpm_mode'] == 'video' and not opts['effects'] and _out_speed(opts) == 1.0 and vid_info['dur'] > 0:
                 _export_track({'root_tmp': tmp, 'vid_file': vid_file, 'vid_trim': vid_trim,
                                'vid_info': vid_info, 'video_speed': None, 'opts': opts},
                               opts, vid_info['dur'])

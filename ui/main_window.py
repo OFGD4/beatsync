@@ -22,9 +22,10 @@ from PySide6.QtGui import QPixmap, QIcon, QGuiApplication
 from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QLabel, QLineEdit, QSlider, QProgressBar,
                                QStackedWidget, QScrollArea, QGridLayout, QHBoxLayout, QVBoxLayout, QFileDialog,
                                QMessageBox, QSizePolicy, QApplication, QAbstractSlider, QAbstractSpinBox,
-                               QAbstractButton, QButtonGroup, QPushButton)
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtMultimediaWidgets import QVideoWidget
+                               QAbstractButton, QButtonGroup, QPushButton, QDoubleSpinBox)
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
+
+from .player import VideoPlayer, FullscreenPlayer
 
 from . import theme as T
 from . import files
@@ -89,13 +90,14 @@ DL_KINDS = [('video', 'Video MP4', 'dl', 'The synced video'),
             ('synced', 'Synced audio', 'dl2', 'The exact soundtrack of the video (offset, mix and fade applied)'),
             ('full', 'Full song', 'dl2', 'The whole song, tempo-matched')]
 KEYS_HELP = ('←  →   nudge one step\nShift + ←  →   ±10 ms (Grid lock off)\n1 – 5   step size\n'
-             'L   Grid lock     R   reset to auto\nSpace   play / pause\nCtrl + Enter   match')
+             'L   Grid lock     R   reset to auto\nSpace   play / pause\nCtrl + Enter   match\n'
+             'Double-click the video   full screen (Esc to leave)')
 
 
 def default_opts():
     return {'song_vol': 1.0, 'hflip': False, 'filters': {k: FMAP[k](FDEF[k]) for k in FDEF}, 'effects': [],
             'fx_division': 'beat', 'fx_intensity': 1.0, 'aspect': 'original', 'fade_out': 0,
-            'quality': 'balanced', 'preview_sec': 15}
+            'quality': 'balanced', 'preview_sec': 15, 'speed': 1.0}
 
 
 def fmt_time(sec, dec=False):
@@ -135,22 +137,6 @@ def frac_beats(b):
 
 def is_url(s):
     return s.startswith(('http://', 'https://')) and '.' in s
-
-
-class VideoView(QVideoWidget):
-    """Double-click or the ⛶ button for full screen; Esc leaves it."""
-    toggled = Signal()
-
-    def mouseDoubleClickEvent(self, e):
-        self.setFullScreen(not self.isFullScreen())
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape and self.isFullScreen():
-            self.setFullScreen(False)
-        elif e.key() == Qt.Key_Space:
-            self.toggled.emit()
-        else:
-            super().keyPressEvent(e)
 
 
 class ModeButton(QPushButton):
@@ -361,6 +347,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(ctx.name)
         self.setAcceptDrops(True)
+        self._make_player()
         self._build()
         self._wire_player()
 
@@ -570,38 +557,23 @@ class MainWindow(QMainWindow):
         self.leds = Leds()
         self.beatpos = label('Bar – · Beat –', muted=True, px=10)
         self.beatpos.setMinimumWidth(96)
+        self.loop = Toggle('Loop', True, small=True)
+        self.keep_pos = Toggle('Keep spot', True, small=True)
+        self.keep_pos.setToolTip('After a change, keep playing from the same moment')
         head = hbox(caps('Preview'), 10, self.leds, self.beatpos, 6, self.render_spin, self.render_text, spacing=6)
         head.addWidget(self.stats_line, 1)
+        head.addSpacing(6)
+        head.addWidget(self.loop)
+        head.addWidget(self.keep_pos)
         pv.add(head)
         self.warn_line = ElidedLabel('')
         self.warn_line.setStyleSheet(f'color: {T.WARN}; font-size: 10px;')
         self.warn_line.hide()
         pv.add(self.warn_line)
-        self.video = VideoView()
+        self.video = VideoPlayer(self.player)
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video.setAspectRatioMode(Qt.KeepAspectRatio)
-        vpal = self.video.palette()
-        vpal.setColor(self.video.backgroundRole(), Qt.black)
-        self.video.setPalette(vpal)
-        self.video.setAutoFillBackground(True)
-        backdrop = QFrame()
-        backdrop.setObjectName('video')
-        backdrop.setMinimumHeight(140)
-        backdrop.setLayout(vbox(self.video))
-        pv.add(backdrop, 1)
-
-        self.play_btn = button('▶', kind='icon', tip='Play / pause (Space)')
-        self.play_btn.setFixedWidth(34)
-        self.time_lbl = label('0:00 / 0:00', muted=True, px=10)
-        self.pos = QSlider(Qt.Horizontal)
-        self.pos.setObjectName('pos')
-        self.pos.setRange(0, 0)
-        self.loop = Toggle('Loop', True, small=True)
-        self.keep_pos = Toggle('Keep spot', True, small=True)
-        self.keep_pos.setToolTip('After a change, keep playing from the same moment')
-        fs = button('⛶', kind='icon', tip='Full screen (double-click the video; Esc to leave)')
-        fs.clicked.connect(lambda: self.video.setFullScreen(True))
-        pv.add(hbox(self.play_btn, self.time_lbl, self.pos, 6, self.loop, self.keep_pos, fs, spacing=8))
+        self.video.fullscreen_toggled.connect(self.toggle_fullscreen)
+        pv.add(self.video, 1)
         lay.addWidget(pv, 10)
 
         # controls
@@ -612,6 +584,7 @@ class MainWindow(QMainWindow):
         tab_grp = QButtonGroup(self)
         self.panes = QStackedWidget()
         for i, (key, name, builder) in enumerate((('timing', 'Timing', self._pane_timing),
+                                                 ('speed', 'Speed', self._pane_speed),
                                                  ('fx', 'Beat FX', self._pane_fx),
                                                  ('color', 'Color', self._pane_color),
                                                  ('frame', 'Frame & fade', self._pane_frame),
@@ -699,6 +672,74 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         self.update_unit_labels()
         return lay
+
+    def _pane_speed(self):
+        lay = vbox(spacing=10, margins=(0, 10, 4, 2))
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(25, 400)
+        self.speed_slider.setValue(100)
+        self.speed_slider.setToolTip('Drag, or type any value in the box (0.25× – 4×)')
+        self.speed_box = QDoubleSpinBox()
+        self.speed_box.setRange(0.25, 4.0)
+        self.speed_box.setDecimals(2)
+        self.speed_box.setSingleStep(0.05)
+        self.speed_box.setValue(1.0)
+        self.speed_box.setSuffix(' ×')
+        self.speed_box.setKeyboardTracking(False)          # apply on Enter / leaving the box, not per digit
+        self.speed_box.setFixedWidth(84)
+        self.speed_box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.speed_box.setToolTip('Any speed: 0.25 = four times slower, 2 = twice as fast')
+        self.speed_slider.valueChanged.connect(lambda v: self.set_speed(v / 100, source='slider'))
+        self.speed_box.valueChanged.connect(lambda v: self.set_speed(v, source='box'))
+        reset = button('1×', tip='Normal speed')
+        reset.clicked.connect(lambda: self.set_speed(1.0))
+        lay.addLayout(self._row('Speed', self.speed_slider, self.speed_box, reset))
+        self.pitch2 = Toggle('Pitch locked', True, small=True)
+        self.pitch2.setToolTip('On: the song keeps its key at any speed.\n'
+                               'Off: pitch follows speed, like a turntable (faster = higher).')
+        self.pitch2.toggled.connect(self.on_pitch)
+        self.pitch2_note = label('the song keeps its key', dim=True, px=10)
+        lay.addLayout(self._row('Pitch', self.pitch2, self.pitch2_note, None))
+        self.speed_info = label('', muted=True, px=11)
+        lay.addWidget(self.speed_info)
+        lay.addWidget(label('Changes the exported video together with its sound (and the Synced audio and Full song '
+                            'downloads). The 1× button on the player only changes how the preview plays.',
+                            dim=True, wrap=True, px=10))
+        lay.addStretch(1)
+        return lay
+
+    def set_speed(self, v, source=None):
+        v = round(max(0.25, min(4.0, float(v))), 2)
+        if source != 'slider':
+            self.speed_slider.blockSignals(True)
+            self.speed_slider.setValue(int(round(v * 100)))
+            self.speed_slider.blockSignals(False)
+        if source != 'box':
+            self.speed_box.blockSignals(True)
+            self.speed_box.setValue(v)
+            self.speed_box.blockSignals(False)
+        self.tab_btns['speed'].setText('Speed' if v == 1.0 else f'Speed  {v:g}×')
+        if abs(self.opts.get('speed', 1.0) - v) > 1e-6:
+            self.opts['speed'] = v
+            self._speed_info()
+            self.schedule_adjust(opts=True)
+
+    def _speed_info(self):
+        sp = self.opts.get('speed', 1.0)
+        j = self.engine.job(self.current_job) if self.current_job else None
+        st = j.get('state') if j else None
+        t = self.timing
+        if not st or not t:
+            self.speed_info.setText('')
+            return
+        base = st['vid_info']['dur'] / (st.get('video_speed') or 1.0)
+        bpm = t['target_bpm'] / (t.get('speed') or 1.0)
+        if abs(sp - 1.0) < 1e-6:
+            self.speed_info.setText(f'Normal speed  ·  {fmt_time(base)} long  ·  {bpm:.1f} BPM')
+        else:
+            word = 'faster' if sp > 1 else 'slower'
+            self.speed_info.setText(f'{sp:g}× {word}  ·  {fmt_time(base)} → {fmt_time(base / sp)}  ·  '
+                                    f'{bpm:.1f} → {bpm * sp:.1f} BPM')
 
     def _pane_fx(self):
         lay = vbox(spacing=8, margins=(0, 8, 4, 2))
@@ -913,10 +954,22 @@ class MainWindow(QMainWindow):
             self.schedule_adjust(opts=True)
 
     def on_pitch(self, on):
-        self.preserve_pitch = bool(on)
-        self.pitch.setText('Pitch locked' if on else 'Pitch follows speed')
-        if self.phase == 'studio':
-            self.schedule_adjust(preserve_pitch=self.preserve_pitch)
+        on = bool(on)
+        changed = on != self.preserve_pitch
+        self.preserve_pitch = on
+        text = 'Pitch locked' if on else 'Pitch follows speed'
+        for t in (self.pitch, getattr(self, 'pitch2', None)):
+            if t is not None:
+                t.blockSignals(True)
+                t.setChecked(on)
+                t.setText(text)
+                t.blockSignals(False)
+                t.updateGeometry()
+                t.update()
+        if hasattr(self, 'pitch2_note'):
+            self.pitch2_note.setText('the song keeps its key' if on else 'like a turntable: faster = higher')
+        if changed and self.phase == 'studio':
+            self.schedule_adjust(preserve_pitch=on)
 
     def _pitch_note(self):
         note = ('Match Song keeps the song untouched — pitch only changes the Full song download.'
@@ -1080,6 +1133,10 @@ class MainWindow(QMainWindow):
         self.shown_timing = self.timing_by_job.get(jid) or self.timing
         first = self.phase == 'analysing'
         keep = self.player.position() if (self.keep_pos.isChecked() and not first) else 0
+        new_sp = (self.timing_by_job.get(jid) or {}).get('speed') or 1.0
+        if keep and self._shown_speed and abs(new_sp - self._shown_speed) > 1e-6:
+            keep = int(keep * self._shown_speed / new_sp)          # same moment of the song at the new speed
+        self._shown_speed = new_sp
         playing = first or self.player.playbackState() == QMediaPlayer.PlayingState
         path = self.engine.preview_path(jid)
         if path:
@@ -1089,7 +1146,7 @@ class MainWindow(QMainWindow):
         self.export_status('Exporting full video…', 0)
         plen = self.opts['preview_sec']
         self.render_text.setText('')
-        self.pos.setToolTip(f'Preview: first {plen}s' if plen else 'Preview: full length')
+        self.video.seek.setToolTip(f'Preview: first {plen}s' if plen else 'Preview: full length')
         if first:
             self.phase = 'studio'
             self.end_analysis(True)
@@ -1252,6 +1309,7 @@ class MainWindow(QMainWindow):
         self.seek_val.setText(fmt_time(self.seek.value() / 10, True))
         self.stat['offset'][0].setText(f'{t["offset"]:.2f}s')
         self.update_unit_labels()
+        self._speed_info()
 
     def update_unit_labels(self):
         step = UNIT_STEP[self.unit]
@@ -1347,36 +1405,70 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════════
     # Player
     # ════════════════════════════════════════════════════════════════════
-    def _wire_player(self):
+    def _make_player(self):
         self.player = QMediaPlayer(self)
-        if not os.environ.get('BEATSYNC_NO_AUDIO'):
-            self.audio = QAudioOutput(self)
+        self.audio = None
+        self._shown_speed = 1.0
+        self.fs_window = None
+        self._dev_timer = QTimer(self)
+        self._dev_timer.timeout.connect(self._follow_default_audio)
+        if not os.environ.get('BEATSYNC_NO_AUDIO'):                  # (tests on machines without sound)
+            self.audio = QAudioOutput(QMediaDevices.defaultAudioOutput(), self)
             self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video)
-        self.player.positionChanged.connect(self._on_pos)
-        self.player.durationChanged.connect(lambda d: self.pos.setRange(0, max(0, d)))
-        self.player.playbackStateChanged.connect(
-            lambda s: self.play_btn.setText('❚❚' if s == QMediaPlayer.PlayingState else '▶'))
+            # The preview's sound follows the Windows default device (e.g. monitor → headphones):
+            # Qt keeps an output on the device it started with unless told otherwise.
+            self.media_devices = QMediaDevices(self)
+            self.media_devices.audioOutputsChanged.connect(self._follow_default_audio)
+        self._dev_timer.start(1500)
+        if hasattr(self.player, 'setPitchCompensation'):            # Qt 6.10+: playback speed keeps the key
+            try:
+                self.player.setPitchCompensation(True)
+            except Exception:
+                pass
+
+    def _follow_default_audio(self):
+        if self.audio is None:
+            return
+        dev = QMediaDevices.defaultAudioOutput()
+        if dev.isNull():
+            return
+        if dev.id() != self.audio.device().id():
+            self.audio.setDevice(dev)
+
+    def _wire_player(self):
+        self.video.activate()
         self.player.mediaStatusChanged.connect(self._on_media_status)
         self.player.errorOccurred.connect(lambda e, s: s and self.set_status('⚠ Preview: ' + s, 'err'))
-        self.play_btn.clicked.connect(self.toggle_play)
-        self.video.toggled.connect(self.toggle_play)
-        self.pos.sliderMoved.connect(self.player.setPosition)
         self.loop.toggled.connect(lambda on: self.player.setLoops(QMediaPlayer.Infinite if on else 1))
         self.player.setLoops(QMediaPlayer.Infinite)
 
     def toggle_play(self):
+        self.video.toggle()
+
+    def toggle_fullscreen(self):
+        if self.fs_window is not None:
+            self.fs_window.close()
+            return
         if self.player.source().isEmpty():
             return
-        if self.player.playbackState() == QMediaPlayer.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
+        fs = FullscreenPlayer(self.player, self.screen())
+        fs.closed.connect(self._fullscreen_closed)
+        self.fs_window = fs
+        fs.view.activate()
+        fs.showFullScreen()
+        fs.activateWindow()
+        fs.view.show_controls()
+
+    def _fullscreen_closed(self):
+        self.fs_window = None
+        self.video.activate()
+        self.activateWindow()
 
     def _load_preview(self, path, keep_ms, play):
         # Swapping the source of a playing player leaves Qt's player stuck at 0 — stop it first,
         # and only seek / play once the *new* file has loaded.
         url = QUrl.fromLocalFile(path)
+        self._follow_default_audio()
         self.player.stop()
         self._pending_load = (url, keep_ms, play)
         self.player.setSource(url)
@@ -1393,18 +1485,13 @@ class MainWindow(QMainWindow):
             if play:
                 self.player.play()
 
-    def _on_pos(self, ms):
-        if not self.pos.isSliderDown():
-            self.pos.setValue(ms)
-        self.time_lbl.setText(f'{fmt_time(ms / 1000)} / {fmt_time(self.player.duration() / 1000)}')
-
     def _release_player(self):
         """Let go of the preview file (Windows keeps files that are open from being deleted)."""
         self._pending_load = None
+        if self.fs_window is not None:
+            self.fs_window.close()
         self.player.stop()
         self.player.setSource(QUrl())
-        self.pos.setRange(0, 0)
-        self.time_lbl.setText('0:00 / 0:00')
 
     def _led_loop(self):
         t = self.shown_timing
@@ -1460,6 +1547,8 @@ class MainWindow(QMainWindow):
         self.fade_seg.set_value('0')
         self.quality_seg.set_value('balanced')
         self.plen_seg.set_value('15')
+        self.set_speed(1.0)
+        self._shown_speed = 1.0
         self.opts = default_opts()                     # the widget resets above must not leave changes behind
         self.pitch.setChecked(True)
         self.set_bpm_mode('video')
@@ -1498,7 +1587,7 @@ class MainWindow(QMainWindow):
                 self.schedule_adjust(beats=self.unit_beats() * d)
             return True
         if key == Qt.Key_Space:
-            if isinstance(focus, QAbstractButton) and focus is not self.play_btn:
+            if isinstance(focus, QAbstractButton):
                 return False
             if e.isAutoRepeat():
                 return True

@@ -25,7 +25,7 @@ a = Analysis(
     pathex=[ROOT],
     datas=datas,
     hiddenimports=['server', 'tools', 'app_info',
-                   'ui', 'ui.main_window', 'ui.dialogs', 'ui.engine', 'ui.files', 'ui.theme', 'ui.widgets',
+                   'ui', 'ui.main_window', 'ui.dialogs', 'ui.engine', 'ui.files', 'ui.theme', 'ui.widgets', 'ui.player',
                    'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets'] + collect_submodules('librosa'),
     excludes=['matplotlib', 'tkinter', 'IPython', 'pandas', 'pytest', 'yt_dlp', 'notebook', 'sphinx',
               'PyQt5', 'PyQt6', 'PySide2', 'webview', 'clr', 'pythonnet'] + ['PySide6.' + m for m in QT_UNUSED],

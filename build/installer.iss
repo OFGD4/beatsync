@@ -2,7 +2,7 @@
 ; Per-user install (no admin rights needed) into %LOCALAPPDATA%\Programs\BeatSync.
 
 #ifndef AppVersion
-  #define AppVersion "3.3.0"
+  #define AppVersion "3.4.0"
 #endif
 #define AppName "BeatSync"
 #define AppExe "BeatSync.exe"
@@ -15,7 +15,7 @@ AppId={{8C1B8A3E-5B7E-4F1B-9D3A-2B6F0E7C4A11}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=OFGD4
+AppPublisher=OFGD
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
 DefaultDirName={localappdata}\Programs\{#AppName}

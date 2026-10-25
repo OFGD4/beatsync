@@ -150,6 +150,17 @@ QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
 
 QToolTip {{ background: {SURFACE2}; color: {TEXT}; border: 1px solid {BORDER2}; padding: 4px 6px; }}
+QMenu {{ background: {SURFACE2}; border: 1px solid {BORDER2}; padding: 4px; }}
+QMenu::item {{ padding: 5px 22px 5px 24px; border-radius: 4px; color: {TEXT}; }}
+QMenu::item:selected {{ background: rgba(255,45,107,0.20); }}
+QMenu::indicator {{ width: 12px; height: 12px; left: 6px; }}
+QMenu::indicator:checked {{ image: url("@CHECK@"); }}
+QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 6px; }}
+QAbstractSpinBox {{ background: {BG}; border: 1px solid {BORDER2}; border-radius: 5px; padding: 4px 7px;
+    color: {ACCENT2}; selection-background-color: {ACCENT}; }}
+QAbstractSpinBox:focus {{ border-color: {ACCENT}; }}
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{ width: 0; border: none; }}
+QInputDialog QLabel {{ color: {TEXT}; }}
 QMessageBox {{ background: {SURFACE}; }}
 QMessageBox QLabel {{ color: {TEXT}; }}
 QMessageBox QPushButton {{ min-width: 72px; color: {TEXT}; }}
