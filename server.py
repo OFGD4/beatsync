@@ -2129,23 +2129,36 @@ def _run(job_id, p):
             _push(job_id, {'type': 'info', 'vid_music_start': round(vid_music_start / sr, 2),
                            'song_music_start': round(song_music_start / sr, 2)})
 
+            # Half / double time: count the song's beat at ½, 1 or 2 so it isn't stretched (or the video
+            # sped up) by 2× when the tempos are an octave apart (e.g. 160 BPM video, 80 BPM song).
+            song_tempo_detected = song_tempo
+            mult_req = p.get('tempo_mult', 1.0)
+            tempo_mult = _pick_tempo_mult(vid_tempo, song_tempo) if mult_req == 'auto' else float(mult_req)
+            if tempo_mult != 1.0:
+                song_tempo = song_tempo * tempo_mult
+                song_beats = _retempo_beats(song_beats, tempo_mult, song_feat['low_env'], sr)
+            mult_note = {0.5: ' (song counted in half time)', 2.0: ' (song counted in double time)',
+                         1.0: ''}.get(tempo_mult, f' (song beat counted ×{tempo_mult:g})')
+
             bpm_mode = p['bpm_mode']
             video_speed = None
             stretch_ratio = 1.0
             engine = 'none'
             if bpm_mode == 'song':
                 video_speed = song_tempo / vid_tempo if vid_tempo > 0 else 1.0
-                _step(job_id, f'Keeping song tempo ({song_tempo:.2f} BPM); video will play at {video_speed:.3f}x...', 46)
+                _step(job_id, f'Keeping song tempo ({song_tempo:.2f} BPM{mult_note}); video will play at '
+                              f'{video_speed:.3f}x...', 46)
                 preserve = resample = song_hq
                 mp3_stretch = vid_tempo / song_tempo if song_tempo > 0 else 1.0
             else:
                 stretch_ratio = vid_tempo / song_tempo if song_tempo > 0 else 1.0
                 mp3_stretch = 1.0
                 if abs(stretch_ratio - 1.0) <= 1e-3:
-                    _step(job_id, 'BPMs already match — no stretch needed...', 46)
+                    _step(job_id, f'BPMs already match{mult_note} — no stretch needed...', 46)
                     preserve = resample = song_hq
                 else:
-                    _step(job_id, f'Stretching {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)...', 46)
+                    _step(job_id, f'Stretching {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)'
+                                  f'{mult_note}...', 46)
                     with ThreadPoolExecutor(1) as ex:    # the turntable version is made alongside
                         f_res = ex.submit(librosa.resample, song_hq, orig_sr=render_sr * stretch_ratio,
                                           target_sr=render_sr)
@@ -2156,7 +2169,9 @@ def _run(job_id, p):
 
             target_tempo = song_tempo if bpm_mode == 'song' else vid_tempo
             _push(job_id, {'type': 'info', 'vid_bpm': round(vid_tempo, 4), 'vid_confidence': vid_conf,
-                           'song_bpm': round(song_tempo, 4), 'song_confidence': song_conf,
+                           'song_bpm': round(song_tempo_detected, 4), 'song_confidence': song_conf,
+                           'tempo_mult': tempo_mult, 'tempo_mult_auto': mult_req == 'auto',
+                           'video_speed': round(video_speed or 1.0, 4),
                            'target_bpm': round(target_tempo, 4), 'mode': bpm_mode,
                            'stretch': round(stretch_ratio, 4), 'stretch_engine': engine})
             low = [n for n, c in (('video', vid_conf), ('song', song_conf)) if c < 0.3]
@@ -2460,6 +2475,58 @@ def api_upload():
     return jsonify({'file_id': file_id, 'name': name, 'ext': ext})
 
 
+TEMPO_MULTS = (0.25, 0.5, 1.0, 2.0, 4.0)          # what Auto chooses from (half / double time)
+TEMPO_MULT_MIN, TEMPO_MULT_MAX = 0.25, 4.0
+
+
+def _tempo_mult_arg(v):
+    """'auto', or how the song's beat is counted against the video: any value 0.25–4
+    (½ = half time, 2 = double time, 1.5 = three song beats per two video beats, …)."""
+    if v in (None, '', 'auto'):
+        return 'auto'
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 'auto'
+    return round(min(TEMPO_MULT_MAX, max(TEMPO_MULT_MIN, f)), 4)
+
+
+def _pick_tempo_mult(vid_bpm, song_bpm):
+    """Count the song's beat at ¼, ½, 1, 2 or 4 — whichever needs the least tempo change.
+    A 80 BPM song fits a 160 BPM video with no stretch at all when counted double (every song beat
+    lands on every other video beat), instead of being sped up 2×. Ties stay at 1."""
+    import math
+    if vid_bpm <= 0 or song_bpm <= 0:
+        return 1.0
+    cost = lambda m: abs(math.log(vid_bpm / (song_bpm * m)))
+    best = min(TEMPO_MULTS, key=cost)
+    return best if cost(best) < cost(1.0) - 0.02 else 1.0
+
+
+def _retempo_beats(beats, m, low_env, sr, hop=None):
+    """The song's beat grid counted at m × its tempo. New beat k sits at position k/m on the
+    detected beat list (so ×2 adds a beat between each pair, ×½ keeps every other beat, ×1.5 puts
+    three beats where there were two), following any tempo drift. Of the possible starting beats
+    the one on which the kick (low end) is strongest wins, so downbeats stay downbeats."""
+    import numpy as np
+    import librosa
+    b = np.atleast_1d(np.asarray(beats, dtype=float))
+    if abs(m - 1.0) < 1e-6 or len(b) < 4:
+        return b
+    idx = np.arange(len(b), dtype=float)
+    best, best_e = None, -1.0
+    for start in range(max(1, int(np.ceil(1.0 / m)))):
+        pos = np.arange(start, len(b) - 1 + 1e-9, 1.0 / m)
+        if len(pos) < 2:
+            continue
+        grid = np.interp(pos, idx, b)
+        frames = np.clip(librosa.time_to_frames(grid, sr=sr, hop_length=hop or HOP), 0, len(low_env) - 1)
+        e = float(np.mean(np.asarray(low_env)[frames]))
+        if e > best_e:
+            best, best_e = grid, e
+    return best if best is not None else b
+
+
 def _opt_float(v):
     if v is None or v == '':
         return None
@@ -2481,6 +2548,7 @@ def api_start():
         'bpm_mode': 'song' if d.get('bpm_mode') == 'song' else 'video',
         'beat_nudge': _clamp(d.get('beat_nudge', 0), -64, 64, 0),
         'preserve_pitch': bool(d.get('preserve_pitch', True)),
+        'tempo_mult': _tempo_mult_arg(d.get('tempo_mult', 1)),         # default: song counted as detected
         'vid_trim_start': _opt_float(d.get('vid_trim_start')), 'vid_trim_end': _opt_float(d.get('vid_trim_end')),
         'song_trim_start': _opt_float(d.get('song_trim_start')), 'song_trim_end': _opt_float(d.get('song_trim_end')),
         'opts': opts,

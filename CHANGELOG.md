@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.6.0
+
+**Changed**
+- **Sliders:** click anywhere on a slider's track and the knob jumps there (and you can keep dragging).
+  Before, only dragging the knob itself moved it.
+- **Song beat:** Auto is now the default — half, normal or double time (also ¼× and 4×), whichever
+  changes the song least. Pick ½×, 1× or 2× directly, or ⋯ for ¼×, ⅓×, ⅔×, 1.5×, 3×, 4× or any value
+  from 0.25 to 4 (Custom…).
+
+## 3.5.0
+
+**New**
+- **Song beat** (Match settings): count the song's beat at ½×, 1× (default — same as before), 2× or
+  Auto. For a slow song on a fast video — e.g. 80 BPM on a 160 BPM video — choose 2× and the song is
+  not stretched at all (every song beat lands on every other video beat), instead of being sped up 2×.
+  ½× does the same for a fast song on a slow video. Auto picks whichever changes the song least.
+  Works in both Match Video and Match Song mode. The Song BPM tile shows the choice (e.g. "80.0 ×2").
+
 ## 3.4.0
 
 **New**

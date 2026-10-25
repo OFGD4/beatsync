@@ -95,6 +95,7 @@ class VideoPlayer(QWidget):
         self.seek.setRange(0, 0)
         self.seek.sliderMoved.connect(self.player.setPosition)
         self.seek.sliderPressed.connect(lambda: self.player.setPosition(self.seek.value()))
+        self.seek.sliderReleased.connect(lambda: self.player.setPosition(self.seek.value()))
         self.rate = QToolButton()
         self.rate.setObjectName('rate')
         self.rate.setPopupMode(QToolButton.InstantPopup)

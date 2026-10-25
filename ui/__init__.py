@@ -8,6 +8,23 @@ FIRST_SIZE = (900, 620)          # first launch: compact and centred; the user c
 MIN_SIZE = (800, 520)
 
 
+def _JumpSliderStyle():
+    """Fusion, except that clicking anywhere on a slider's track moves the knob straight there
+    (and you can keep dragging), instead of stepping towards the click."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QProxyStyle, QStyle, QStyleFactory
+
+    class JumpSliderStyle(QProxyStyle):
+        def styleHint(self, hint, option=None, widget=None, returnData=None):
+            if hint == QStyle.SH_Slider_AbsoluteSetButtons:
+                return Qt.LeftButton.value
+            if hint == QStyle.SH_Slider_PageSetButtons:
+                return 0
+            return super().styleHint(hint, option, widget, returnData)
+
+    return JumpSliderStyle(QStyleFactory.create('Fusion'))
+
+
 def create_app(font_dir, icon_path=None):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication, QPalette, QColor, QIcon
@@ -17,7 +34,7 @@ def create_app(font_dir, icon_path=None):
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName('BeatSync')
-    app.setStyle('Fusion')
+    app.setStyle(_JumpSliderStyle())
     try:
         app.styleHints().setColorScheme(Qt.ColorScheme.Dark)      # dark title bar on Windows 10/11 (Qt 6.8+)
     except Exception:

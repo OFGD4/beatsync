@@ -2,7 +2,7 @@
 ; Per-user install (no admin rights needed) into %LOCALAPPDATA%\Programs\BeatSync.
 
 #ifndef AppVersion
-  #define AppVersion "3.4.0"
+  #define AppVersion "3.6.0"
 #endif
 #define AppName "BeatSync"
 #define AppExe "BeatSync.exe"

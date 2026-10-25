@@ -332,6 +332,7 @@ class MainWindow(QMainWindow):
         self.phase = 'idle'                      # idle | analysing | studio
         self.pending = None
         self.bpm_mode = 'video'
+        self.tempo_mult = 'auto'                 # song beat counted at auto / any multiple (½, 2, 1.5 …)
         self.preserve_pitch = True
         self.unit, self.lock = 'beat', True
         self.opts = default_opts()
@@ -429,6 +430,18 @@ class MainWindow(QMainWindow):
         self.mode_vid.clicked.connect(lambda: self.set_bpm_mode('video'))
         self.mode_song.clicked.connect(lambda: self.set_bpm_mode('song'))
         card.add(hbox(self.mode_vid, self.mode_song, spacing=6))
+        self.mult_seg = Segmented([('auto', 'Auto'), ('0.5', '½×'), ('1', '1×'), ('2', '2×'), ('more', '⋯')], 'auto',
+                                  stretch=True)
+        self.mult_seg.setToolTip(
+            "How the song's beat is counted against the video.\n"
+            'Auto: half, normal or double time — whichever changes the song least.\n'
+            '2×: a slow song, e.g. 80 BPM on a 160 BPM video: no stretching.\n'
+            '½×: a fast song, e.g. 160 BPM on an 80 BPM video.\n'
+            '⋯: more choices (¼×, ⅓×, ⅔×, 1.5×, 3×, 4×) or any value you type.')
+        self.mult_seg.changed.connect(self._on_mult_seg)
+        self.mult_seg.setStyleSheet('QPushButton { padding: 4px 5px; }')
+        self._build_mult_menu()
+        card.add(hbox(caps('Song beat'), 4, self.mult_seg, spacing=6))
 
         self.mix = QSlider(Qt.Horizontal)
         self.mix.setRange(0, 100)
@@ -947,6 +960,63 @@ class MainWindow(QMainWindow):
         if self.phase == 'studio':
             self.show_toast('Tempo mode changes need a new match — press Match Again')
 
+    MULT_MORE = [(0.25, '¼×'), (1 / 3, '⅓×'), (2 / 3, '⅔×'), (1.5, '1.5×'), (3.0, '3×'), (4.0, '4×')]
+
+    def _build_mult_menu(self):
+        from PySide6.QtWidgets import QMenu
+        m = QMenu(self)
+        for val, text in self.MULT_MORE:
+            a = m.addAction(text)
+            a.triggered.connect(lambda _=False, v=val: self.set_tempo_mult(f'{v:.4f}'))
+        m.addSeparator()
+        custom = m.addAction('Custom…')
+        custom.triggered.connect(self._custom_mult)
+        self.mult_menu = m
+
+    def _on_mult_seg(self, v):
+        if v == 'more':
+            btn = self.mult_seg.buttons['more']
+            self.mult_menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+            self._show_mult()                      # menu closed without a choice: show the current one again
+        else:
+            self.set_tempo_mult(v)
+
+    def _custom_mult(self):
+        from PySide6.QtWidgets import QInputDialog
+        cur = 1.0 if self.tempo_mult == 'auto' else float(self.tempo_mult)
+        v, ok = QInputDialog.getDouble(self, 'Song beat', "Count the song's beat at (0.25 – 4):\n"
+                                       '2 = double time, 0.5 = half time, 1.5 = three song beats per two video beats',
+                                       cur, 0.25, 4.0, 2)
+        if ok:
+            self.set_tempo_mult(f'{v:.4f}')
+
+    @staticmethod
+    def mult_label(v):
+        names = {0.25: '¼', 0.5: '½', 1.0: '1', 2.0: '2', 0.3333: '⅓', 0.6667: '⅔'}
+        return names.get(round(float(v), 4), f'{float(v):g}') + '×'
+
+    def _show_mult(self):
+        v = self.tempo_mult                    # 'auto', '0.5', '1', '2' or another value like '1.5000'
+        more = self.mult_seg.buttons['more']
+        if v in self.mult_seg.buttons:
+            self.mult_seg.set_value(v)
+            more.setText('⋯')
+        else:
+            more.setText(self.mult_label(v))
+            more.setChecked(True)
+        more.setMinimumWidth(more.fontMetrics().horizontalAdvance(more.text()) + 14)
+
+    def set_tempo_mult(self, v):
+        v = str(v)
+        if v not in ('auto',):
+            f = round(max(0.25, min(4.0, float(v))), 4)
+            v = {0.5: '0.5', 1.0: '1', 2.0: '2'}.get(f, f'{f:.4f}')
+        changed = v != self.tempo_mult
+        self.tempo_mult = v
+        self._show_mult()
+        if changed and self.phase == 'studio':
+            self.show_toast('Song beat changes need a new match — press Match Again')
+
     def on_mix(self, v):
         self.mix_val.setText(f'{v}%')
         self.opts['song_vol'] = v / 100
@@ -982,7 +1052,8 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════════
     def run(self):
         self.hide_error()
-        p = {'bpm_mode': self.bpm_mode, 'preserve_pitch': self.preserve_pitch, 'opts': copy.deepcopy(self.opts)}
+        p = {'bpm_mode': self.bpm_mode, 'preserve_pitch': self.preserve_pitch, 'opts': copy.deepcopy(self.opts),
+             'tempo_mult': self.tempo_mult}
         for box, key, name in ((self.vid, 'video', 'video'), (self.song, 'song', 'song')):
             if box.mode == 'url':
                 u = box.url.text().strip()
@@ -1104,7 +1175,15 @@ class MainWindow(QMainWindow):
         if m.get('vid_bpm'):
             self.stat['vid'][0].setText(f'{float(m["vid_bpm"]):.1f}')
         if m.get('song_bpm'):
-            self.stat['song'][0].setText(f'{float(m["song_bpm"]):.1f}')
+            mult = float(m.get('tempo_mult') or 1.0)
+            tag = '' if abs(mult - 1.0) < 1e-4 else ' ×' + self.mult_label(mult)[:-1]
+            song_bpm = float(m['song_bpm'])
+            self.stat['song'][0].setText(f'{song_bpm:.1f}{tag}')
+            self.stat['song'][0].setToolTip(f'Detected {song_bpm:.1f} BPM, counted ×{mult:g} = {song_bpm * mult:.1f} BPM'
+                                            if tag else '')
+            if tag and m.get('tempo_mult_auto'):
+                kind = {2.0: 'double time', 0.5: 'half time'}.get(mult, f'×{mult:g}')
+                self.show_toast(f'Auto: song counted in {kind} ({song_bpm:.0f} → {song_bpm * mult:.0f} BPM)')
         for k, ck in (('vid', 'vid_confidence'), ('song', 'song_confidence')):
             if m.get(ck) is not None:
                 self.stat[k][1].setStyleSheet(f'background: {conf_color(m[ck])}; border-radius: 3px;')
@@ -1552,6 +1631,7 @@ class MainWindow(QMainWindow):
         self.opts = default_opts()                     # the widget resets above must not leave changes behind
         self.pitch.setChecked(True)
         self.set_bpm_mode('video')
+        self.set_tempo_mult('auto')
         self.set_rendering(None)
         self.set_status('')
         self.warn_line.hide()
