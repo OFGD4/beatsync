@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.2.4
+
+**Changed**
+- The window opens at a comfortable size (about 1000×720, centred) instead of almost filling the
+  screen. On small or high-scaling screens (e.g. a 1080p laptop at 150 %) it shrinks to fit.
+  It can still be maximised.
+- Reorganised for smaller windows: a one-line header; video and song on the left, match settings
+  and the Match button on the right; after matching, the preview and Download stay on the left
+  (always in view) and the timing / effects / color / export controls sit on the right.
+  Narrow windows fall back to one column.
+
+## 3.2.3
+
+**Fixed**
+- The preview went blank after saving a file, until a nudge or setting change. The preview is
+  now reloaded right after the Save-as dialog, after "Show in folder", and when the window comes
+  back from being minimised — same spot, same play state.
+
 ## 3.2.2
 
 **Fixed**

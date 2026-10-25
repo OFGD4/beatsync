@@ -23,20 +23,39 @@
     background: radial-gradient(ellipse 60% 40% at 20% 20%, rgba(255,45,107,0.07) 0%, transparent 60%),
                 radial-gradient(ellipse 50% 50% at 80% 80%, rgba(45,107,255,0.07) 0%, transparent 60%);
   }
-  .wrap { position: relative; z-index: 1; max-width: 820px; margin: 0 auto; padding: 48px 24px 80px; }
+  .wrap { position: relative; z-index: 1; max-width: 1180px; margin: 0 auto; padding: 20px 22px 48px; }
   button { font-family: inherit; }
   :focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
 
   /* Header */
-  header { margin-bottom: 40px; }
-  .logo { font-family: 'Bebas Neue', sans-serif; font-size: 72px; line-height: 1; letter-spacing: 4px;
+  header { display: flex; align-items: center; gap: 18px; margin-bottom: 18px; }
+  .logo { font-family: 'Bebas Neue', sans-serif; font-size: 46px; line-height: 1; letter-spacing: 3px; flex-shrink: 0;
     background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text;
     -webkit-text-fill-color: transparent; background-clip: text; }
-  .tagline { font-size: 11px; color: var(--muted); letter-spacing: 0.2em; text-transform: uppercase; margin-top: 6px; }
-  .beat-bars { display: flex; gap: 3px; align-items: flex-end; height: 28px; margin-top: 16px; }
+  .head-text { min-width: 0; }
+  .tagline { font-size: 10px; color: var(--muted); letter-spacing: 0.16em; text-transform: uppercase; }
+  .beat-bars { display: flex; gap: 3px; align-items: flex-end; height: 28px; margin-left: auto; overflow: hidden; flex-shrink: 1; min-width: 0; }
   .beat-bar { width: 3px; background: var(--accent); border-radius: 1px; opacity: 0.4; animation: barDance var(--dur) ease-in-out infinite alternate; }
   @keyframes barDance { from { height: 4px; opacity: 0.2; } to { height: var(--h); opacity: 0.7; } }
-  .caps-line { font-size: 10px; color: var(--dim); margin-top: 10px; letter-spacing: 0.05em; }
+  .caps-line { font-size: 10px; color: var(--dim); margin-top: 5px; letter-spacing: 0.05em; }
+
+  /* Layout: setup in two columns, studio as a workspace (preview + download | controls) */
+  .setup { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  .setup .sources { grid-template-columns: 1fr; }
+  .setup-side { display: flex; flex-direction: column; gap: 14px; }
+  .setup-side .card, .setup-side .error-msg { margin: 0; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; align-items: start; margin-top: 14px; }
+  .workspace .card { margin-bottom: 0; padding: 18px; }
+  .ws-left { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 14px; }
+  #controls-card .tabs { margin-top: 0; gap: 0; }
+  #controls-card .tab { padding: 10px 7px; letter-spacing: 0.05em; flex: 1 0 auto; }
+  #export .ex-title { font-size: 24px; letter-spacing: 2.5px; }
+  #export .ex-head .reset-btn { margin: 0 0 0 auto; align-self: center; padding: 6px 12px; }
+  #export .dl-btns { margin-top: 12px; flex-wrap: nowrap; }
+  #export .dl { padding: 10px 12px; font-size: 15px; letter-spacing: 1.8px; white-space: nowrap; flex: 1 1 auto; }
+  #controls-card .nudge-grid { grid-template-columns: 1fr 1fr; grid-template-areas: 'bb bf' 'fb ff'; }
+  #n-back { grid-area: bb; } #n-fwd { grid-area: bf; } #n-fine-back { grid-area: fb; } #n-fine-fwd { grid-area: ff; }
+  #controls-card .fx-grid { grid-template-columns: repeat(4, 1fr); }
   .caps-line b { color: var(--warn); font-weight: 500; }
 
   /* Cards */
@@ -146,9 +165,9 @@
   .conf { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 4px; vertical-align: middle; background: var(--dim); }
 
   /* Studio */
-  #studio { display: none; margin-top: 14px; }
   .player { position: relative; background: #000; border-radius: 6px; overflow: hidden; }
-  .player video { width: 100%; max-height: 420px; display: block; background: #000; outline: none; }
+  /* the preview, the beat line and the Download card fit in the window together */
+  .player video { width: 100%; max-height: max(180px, calc(100vh - 340px)); display: block; background: #000; outline: none; }
   .player-overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; gap: 10px; background: rgba(8,8,16,0.55); font-size: 11px; letter-spacing: 0.08em; pointer-events: none; backdrop-filter: blur(1px); }
   .player-overlay.show { display: flex; }
   .beatline { display: flex; align-items: center; gap: 14px; margin-top: 12px; flex-wrap: wrap; }
@@ -207,7 +226,7 @@
   .status-line .spinner { width: 8px; height: 8px; }
 
   /* Export */
-  #export { display: none; margin-top: 14px; border-color: rgba(45,255,176,0.45); }
+  #export { display: none; border-color: rgba(45,255,176,0.45); }
   .ex-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   .ex-title { font-family: 'Bebas Neue', sans-serif; font-size: 28px; letter-spacing: 3px; color: var(--success); }
   .ex-sub { font-size: 10px; color: var(--muted); }
@@ -232,8 +251,7 @@
   .hidden { display: none !important; }
 
   /* Header actions + update banner */
-  header { position: relative; }
-  .head-actions { position: absolute; top: 6px; right: 0; display: flex; gap: 8px; }
+  .head-actions { display: flex; gap: 8px; flex-shrink: 0; }
   .gear { background: var(--surface); border: 1px solid var(--border2); color: var(--muted); border-radius: 6px; padding: 7px 12px; font-size: 11px; letter-spacing: 0.08em; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
   .gear:hover { color: var(--text); border-color: var(--muted); }
   .gear .pip { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); display: none; }
@@ -284,13 +302,24 @@
   .saved-line { margin-top: 10px; font-size: 11px; color: var(--success); display: none; align-items: center; gap: 10px; word-break: break-all; }
   .saved-line.show { display: flex; }
 
+  /* Narrower windows: one column, in the order you use it */
+  @media (max-width: 899px) {
+    .setup { grid-template-columns: 1fr; }
+    .setup .sources { grid-template-columns: 1fr 1fr; }
+    .beat-bars { display: none; }
+    .head-actions { margin-left: auto; }
+    .workspace { display: flex; flex-direction: column; align-items: stretch; }
+    .ws-left, .ws-right { display: contents; }
+    #player-card { order: 1; } #controls-card { order: 2; } #export { order: 3; }
+  }
   @media (max-width: 680px) {
-    .head-actions { position: static; margin-top: 12px; }
-    .wrap { padding: 28px 16px 60px; }
-    .logo { font-size: 52px; }
-    .sources, .opt-grid { grid-template-columns: 1fr; }
+    header { flex-wrap: wrap; }
+    .wrap { padding: 20px 16px 48px; }
+    .logo { font-size: 40px; }
+    .sources, .setup .sources, .opt-grid { grid-template-columns: 1fr; }
     .stats { grid-template-columns: repeat(3, 1fr); }
-    .fx-grid { grid-template-columns: repeat(3, 1fr); }
+    .fx-grid, #controls-card .fx-grid { grid-template-columns: repeat(3, 1fr); }
+    #export .dl-btns { flex-wrap: wrap; }
     .nudge-grid { grid-template-columns: repeat(2, 1fr); }
     .frow { grid-template-columns: 78px 1fr 38px; }
     .seg button { padding: 7px 9px; }
@@ -303,15 +332,18 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="head-actions"><button class="gear" id="open-settings" aria-label="Settings"><span class="pip"></span>&#9881; Settings</button></div>
     <div class="logo">BEATSYNC</div>
-    <div class="tagline">Align any song to any video by BPM matching</div>
+    <div class="head-text">
+      <div class="tagline">Align any song to any video by BPM matching</div>
+      <div class="caps-line" id="caps-line"></div>
+    </div>
     <div class="beat-bars" id="beat-bars" aria-hidden="true"></div>
-    <div class="caps-line" id="caps-line"></div>
+    <div class="head-actions"><button class="gear" id="open-settings" aria-label="Settings"><span class="pip"></span>&#9881; Settings</button></div>
   </header>
   <div class="banner" id="update-banner"><span id="update-text"></span><button class="btn-ghost" id="update-get" style="padding:6px 12px">Download</button></div>
 
-  <!-- ─── 1. Sources ─────────────────────────────────────────────────── -->
+  <!-- ─── 1–3. Setup: sources on the left, match settings + button on the right ── -->
+  <div class="setup">
   <div class="sources">
     <div class="card focusable" id="card-vid">
       <div class="card-label"><span class="step-no">1</span><span class="dot dot-red"></span>Video</div>
@@ -372,8 +404,8 @@
     </div>
   </div>
 
-  <!-- ─── 3. Settings ────────────────────────────────────────────────── -->
-  <div class="card" style="margin-top:14px;">
+  <div class="setup-side">
+  <div class="card">
     <div class="card-label"><span class="step-no">3</span><span class="dot dot-blue"></span>Match settings</div>
     <div class="opt-grid">
       <button class="opt on" data-bpm="video">
@@ -401,6 +433,8 @@
 
   <div class="error-msg" id="error" role="alert"><button onclick="hideErr()" aria-label="Dismiss">&times;</button><span id="error-text"></span></div>
   <button class="run-btn" id="run-btn">Match Beats<small>Ctrl + Enter</small></button>
+  </div>
+  </div>
 
   <!-- ─── Progress ───────────────────────────────────────────────────── -->
   <div class="card" id="progress">
@@ -420,8 +454,10 @@
     <div class="warn-msg" id="warn"></div>
   </div>
 
-  <!-- ─── Studio ─────────────────────────────────────────────────────── -->
-  <div class="card" id="studio">
+  <!-- ─── Studio: preview + download on the left, controls on the right ── -->
+  <div class="workspace" id="studio" style="display:none">
+  <div class="ws-left">
+  <div class="card" id="player-card">
     <div class="card-label"><span class="step-no">4</span><span class="dot dot-info"></span>Studio <span style="margin-left:auto;color:var(--dim);letter-spacing:0.05em;text-transform:none" id="preview-len-note"></span></div>
     <div class="player" id="player">
       <video id="video" controls playsinline preload="auto"></video>
@@ -435,7 +471,27 @@
       <label class="mini"><input type="checkbox" id="keep-pos" checked> Keep position</label>
       <button class="icon-btn" id="fs-btn" title="Fullscreen">&#9974;</button>
     </div>
+  </div>
 
+  <!-- ─── Export ─────────────────────────────────────────────────────── -->
+  <div class="card" id="export">
+    <div class="ex-head">
+      <div class="ex-title">Download</div>
+      <div class="ex-sub" id="ex-sub"></div>
+      <button class="reset-btn" id="reset-btn">Start over</button>
+    </div>
+    <div class="ex-status" id="ex-status"></div>
+    <div class="dl-btns">
+      <a class="dl disabled" id="dl-mp4" href="#">Video MP4</a>
+      <a class="dl secondary disabled" id="dl-synced" href="#" title="The exact soundtrack of the video (offset, mix and fade applied)">Synced audio</a>
+      <a class="dl secondary disabled" id="dl-full" href="#" title="The whole song, tempo-matched">Full song (BPM-matched)</a>
+    </div>
+    <div class="saved-line" id="saved-line"><span id="saved-path"></span><button class="btn-ghost" id="saved-show" style="padding:5px 10px">Show in folder</button></div>
+  </div>
+  </div>
+
+  <div class="ws-right">
+  <div class="card" id="controls-card">
     <div class="tabs" role="tablist">
       <button class="tab on" data-pane="timing">Timing</button>
       <button class="tab" data-pane="effects">Beat FX<span class="count" id="fx-count"></span></button>
@@ -554,21 +610,7 @@
 
     <div class="status-line" id="status"></div>
   </div>
-
-  <!-- ─── Export ─────────────────────────────────────────────────────── -->
-  <div class="card" id="export">
-    <div class="ex-head">
-      <div class="ex-title">Download</div>
-      <div class="ex-sub" id="ex-sub"></div>
-    </div>
-    <div class="ex-status" id="ex-status"></div>
-    <div class="dl-btns">
-      <a class="dl disabled" id="dl-mp4" href="#">Video MP4</a>
-      <a class="dl secondary disabled" id="dl-synced" href="#" title="The exact soundtrack of the video (offset, mix and fade applied)">Synced audio</a>
-      <a class="dl secondary disabled" id="dl-full" href="#" title="The whole song, tempo-matched">Full song (BPM-matched)</a>
-    </div>
-    <div class="saved-line" id="saved-line"><span id="saved-path"></span><button class="btn-ghost" id="saved-show" style="padding:5px 10px">Show in folder</button></div>
-    <button class="reset-btn" id="reset-btn">Start over</button>
+  </div>
   </div>
 </div>
 
@@ -1017,7 +1059,7 @@
     if (S.phase === 'analysing') {
       S.phase = 'studio';
       endAnalysis(true);
-      $('studio').style.display = 'block'; $('export').style.display = 'block';
+      $('studio').style.display = ''; $('export').style.display = 'block';
       buildLeds();
       $('pitch-note').textContent = S.bpmMode === 'song' ? 'Match Song keeps the song untouched — pitch only affects the Full-song MP3.' : '';
       setTimeout(() => $('studio').scrollIntoView({ behavior: 'smooth', block: 'start' }), 150);
@@ -1060,9 +1102,31 @@
       if (r && r.ok) { S.lastSaved = r.path; $('saved-path').textContent = 'Saved: ' + r.path; $('saved-line').classList.add('show'); toast('Saved', 'success'); }
       else if (r && r.error) toast(r.error, 'error');
     } catch (err) { toast(String((err && err.message) || err), 'error'); }
-    finally { $(id).textContent = DL_LABEL[id]; S.saving = false; }
+    finally { $(id).textContent = DL_LABEL[id]; S.saving = false; reloadPreview(); }
   }));
-  $('saved-show').addEventListener('click', () => { if (isDesktop() && S.lastSaved) window.pywebview.api.reveal(S.lastSaved); });
+  $('saved-show').addEventListener('click', async () => {
+    if (!isDesktop() || !S.lastSaved) return;
+    try { await window.pywebview.api.reveal(S.lastSaved); } finally { setTimeout(reloadPreview, 400); }
+  });
+
+  // Windows (WebView2) can lose the preview picture while a native window is in front of the
+  // app (the Save-as dialog, Explorer) or while it is minimised: the player stays blank until a
+  // new preview is loaded. So the same preview is simply reloaded — same spot, same play state.
+  function reloadPreview() {
+    const v = $('video');
+    if (!S.previewFor || S.phase !== 'studio' || !v.getAttribute('src')) return;
+    const t = isNaN(v.currentTime) ? 0 : v.currentTime, playing = !v.paused;
+    v.onloadedmetadata = () => {
+      if (t && t < v.duration - 0.1) v.currentTime = t;
+      if (playing) v.play().catch(() => {});
+    };
+    v.src = '/api/file/preview/' + S.previewFor + '?t=' + Date.now();
+  }
+  let hiddenAt = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 500 && isDesktop()) { hiddenAt = 0; reloadPreview(); }
+  });
 
   function setDownloads(jobId, stale) {
     $('dl-mp4').href = '/api/file/' + jobId;

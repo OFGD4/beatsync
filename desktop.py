@@ -307,6 +307,36 @@ def warm_up():
 
 # ── JavaScript bridge (window.pywebview.api.* in the page) ───────────────────
 
+def initial_window_size():
+    """First-open window size in logical pixels (what pywebview expects): 1000×720 on a normal
+    screen, but never more than 80 % × 86 % of the free desktop area, so small or high-scaling
+    screens (e.g. a 1080p laptop at 150 %) get a window that fits instead of a near-maximised one."""
+    w, h = 1000, 720
+    if os.name != 'nt':
+        return w, h
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):     # SPI_GETWORKAREA
+            return w, h
+        try:
+            dpi = user32.GetDpiForSystem()
+        except Exception:
+            hdc = user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)                         # LOGPIXELSX
+            user32.ReleaseDC(0, hdc)
+        scale = (dpi or 96) / 96.0
+        # Work area and DPI come from the same DPI context, so this is logical pixels either way.
+        aw, ah = (rect.right - rect.left) / scale, (rect.bottom - rect.top) / scale
+        w, h = int(min(w, aw * 0.80)), int(min(h, ah * 0.86))
+        logging.info('window: work area %dx%d at %d%% -> %dx%d', aw, ah, round(scale * 100), w, h)
+    except Exception:
+        logging.exception('window size: using the default')
+    return w, h
+
+
 def save_folder():
     """Where the Save-as dialog opens: the last folder used, else Downloads, else home."""
     last = tools._load_state().get('last_save_dir')
@@ -551,8 +581,10 @@ def run(args, log_path):
     STATE['updated_from'] = tools.just_updated_from() if tools.FROZEN else ''
     api = Api()
     api._server = server
+    width, height = initial_window_size()
     window = webview.create_window(
-        APP_NAME, url=url, js_api=api, width=1200, height=900, min_size=(880, 640),
+        APP_NAME, url=url, js_api=api, width=width, height=height,
+        min_size=(min(760, width), min(560, height)),       # opens centred; can still be maximised
         background_color='#080810', text_select=True)
     api._window = window
     STATE['window'] = window
