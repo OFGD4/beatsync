@@ -29,11 +29,6 @@ they are read where they are (no upload, no copy), so even multi-GB videos are r
 **Window:** opens at a compact 900×620 in the middle of the screen, laid out like a desktop app — nothing
 scrolls as a page. Maximise it for a bigger preview.
 
-**Tempo Lab** (Song card → ♩ Tempo Lab, or the *Tempo Lab* shortcut): load a song from a link or file, see its
-BPM curve (also for songs that change tempo), drag across it to pick the part you want, and export that part —
-as it is, or at a new BPM (every beat locked to the target, or one speed that keeps the song's own changes).
-**Use in BeatSync** hands the result straight to the main window as the song.
-
 ### Where things live
 
 | What | Where |

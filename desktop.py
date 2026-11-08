@@ -8,7 +8,6 @@ and shows the UI in a native window (Microsoft Edge WebView2 on Windows).
     BeatSync.exe --headless      engine only; open the printed URL in a browser
     BeatSync.exe --debug         window with developer tools (right-click → Inspect)
     BeatSync.exe --selftest      check the engine, the page and the window component, then exit
-    BeatSync.exe --tempo         also open the Tempo Lab window
 """
 
 import os
@@ -141,12 +140,12 @@ def _bind_lock():
         return None
 
 
-def _ask_running_instance(msg=b'focus'):
+def _ask_running_instance():
     """Returns 'ok' (focused), 'starting', 'stuck', 'none' (no answer) or 'refused' (nobody listening)."""
     try:
         with socket.create_connection(('127.0.0.1', INSTANCE_PORT), timeout=3) as c:
             c.settimeout(3)
-            c.sendall(msg)
+            c.sendall(b'focus')
             return c.recv(16).decode('ascii', 'replace') or 'none'
     except ConnectionRefusedError:
         return 'refused'
@@ -198,11 +197,11 @@ def _retry_bind(seconds):
     return None
 
 
-def acquire_instance_lock(msg=b'focus'):
-    """Returns (proceed, lock_socket_or_None). msg b'tempo' asks a running copy to open Tempo Lab."""
+def acquire_instance_lock():
+    """Returns (proceed, lock_socket_or_None)."""
     s = _bind_lock()
     if s is None:
-        answer = _ask_running_instance(msg)
+        answer = _ask_running_instance()
         logging.info('lock busy, other side answered: %s', answer)
         if answer in ('ok', 'starting'):
             return False, None                           # it is alive and now in front
@@ -242,18 +241,14 @@ def listen_for_focus(lock_sock):
                 return
             with conn:
                 try:
-                    msg = conn.recv(16)
-                    if msg not in (b'focus', b'tempo'):
+                    if conn.recv(16) != b'focus':
                         continue
                     w = STATE['window']
                     if w is not None and STATE['shown']:
-                        if msg == b'tempo' and STATE.get('api') is not None:
-                            STATE['api'].open_tempo_lab()        # the "Tempo Lab" shortcut
-                        else:
-                            w.restore()
-                            w.show()
-                            w.on_top = True
-                            w.on_top = False
+                        w.restore()
+                        w.show()
+                        w.on_top = True
+                        w.on_top = False
                         conn.sendall(b'ok')
                     elif time.time() - STATE['started'] < 60:
                         conn.sendall(b'starting')
@@ -520,71 +515,6 @@ class Api:
                 logging.exception('full screen toggle failed')
         return True
 
-    # ── Tempo Lab (second window) ─────────────────────────────────────────
-    def open_tempo_lab(self):
-        """Open the Tempo Lab window, or bring it to the front if it is already open."""
-        w = STATE.get('tempo')
-        if w is not None:
-            try:
-                w.restore()
-                w.show()
-                w.on_top = True
-                w.on_top = False
-                return True
-            except Exception:
-                STATE['tempo'] = None
-        open_tempo_window(self._server)
-        return True
-
-    def tempo_save(self, sid):
-        """Save-as dialog for the last Tempo Lab export."""
-        import tempo_lab
-        try:
-            path, name = tempo_lab.result_file(sid)
-        except Exception as e:
-            return {'ok': False, 'error': str(e)}
-        ext = os.path.splitext(name)[1].lower()
-        label = {'.mp3': 'MP3 audio', '.wav': 'WAV audio', '.flac': 'FLAC audio', '.m4a': 'M4A audio'}.get(ext, 'Audio')
-        folder = save_folder()
-        dest = self._first(self._window.create_file_dialog(
-            self._dialog('save'), directory=str(folder) if folder else '',
-            save_filename=free_name(folder, name) if folder else name, file_types=(f'{label} (*{ext})',)))
-        if not dest:
-            return {'ok': False, 'cancelled': True}
-        if not dest.lower().endswith(ext):
-            dest += ext
-        try:
-            place_file(path, dest)
-        except OSError as e:
-            return {'ok': False, 'error': f'Could not save: {e}'}
-        remember_save_folder(os.path.dirname(dest))
-        return {'ok': True, 'path': dest}
-
-    def tempo_use(self, sid):
-        """Hand the last Tempo Lab export to the main window as its song."""
-        import tempo_lab
-        main = STATE.get('window')
-        if main is None:
-            return {'ok': False, 'error': 'The BeatSync window is closed.'}
-        try:
-            path, name = tempo_lab.result_file(sid)
-            shared = Path(os.environ['BEATSYNC_TEMP']) / 'tempo_lab_songs'
-            shared.mkdir(parents=True, exist_ok=True)
-            dest = str(shared / free_name(shared, name))
-            place_file(path, dest)                       # stays valid when Tempo Lab loads another song
-            item = dict(self._server.register_local(dest), ok=True)
-        except Exception as e:
-            return {'ok': False, 'error': str(e)}
-        main.evaluate_js('window.beatsyncUseSong && window.beatsyncUseSong(%s)' % json.dumps(item))
-        try:
-            main.restore()
-            main.show()
-            main.on_top = True
-            main.on_top = False
-        except Exception:
-            pass
-        return {'ok': True, 'name': item.get('name')}
-
     def install_update(self):
         if not tools.FROZEN:
             return {'ok': False, 'error': 'Updates can only be installed in the installed app.'}
@@ -614,7 +544,7 @@ class Api:
 
 # ── Window extras ────────────────────────────────────────────────────────────
 
-def dark_title_bar(title=APP_NAME):
+def dark_title_bar():
     """Windows 10/11: a dark title bar to match the app (DWMWA_USE_IMMERSIVE_DARK_MODE)."""
     if os.name != 'nt':
         return
@@ -632,7 +562,7 @@ def dark_title_bar(title=APP_NAME):
                 n = user32.GetWindowTextLengthW(hwnd)
                 buf = ctypes.create_unicode_buffer(n + 1)
                 user32.GetWindowTextW(hwnd, buf, n + 1)
-                if buf.value == title:
+                if buf.value == APP_NAME:
                     found.append(hwnd)
             return True
 
@@ -680,30 +610,6 @@ def bind_native_drop(window, server):
     window.events.loaded += bind
 
 
-TEMPO_TITLE = 'Tempo Lab'
-
-
-def open_tempo_window(server):
-    """Second window: tempo curve, cut a part, change its BPM (tempo_lab.py + templates/tempo.html)."""
-    import webview
-    api = Api()
-    api._server = server
-    width, height = initial_window_size()
-    win = webview.create_window(
-        TEMPO_TITLE, url=STATE['url'] + 'tempo', js_api=api, width=width, height=height,
-        min_size=(min(720, width), min(520, height)), background_color='#080810', text_select=True)
-    api._window = win
-    STATE['tempo'] = win
-    bind_native_drop(win, server)
-    win.events.shown += lambda: dark_title_bar(TEMPO_TITLE)
-
-    def closed():
-        if STATE.get('tempo') is win:
-            STATE['tempo'] = None
-    win.events.closed += closed
-    return win
-
-
 def selftest(log_path):
     """Release-build check: the engine starts, the page and its files load, the window component imports."""
     try:
@@ -719,8 +625,6 @@ def selftest(log_path):
         for name in ('fonts/bebas-neue-latin-400-normal.woff2', 'fonts/dm-mono-latin-400-normal.woff2', 'icon-256.png'):
             opener.open(f'{base}/assets/{name}', timeout=30).read()
         caps = json.loads(opener.open(base + '/api/caps', timeout=120).read())
-        if 'TEMPO LAB' not in opener.open(base + '/tempo', timeout=30).read().decode('utf-8'):
-            raise RuntimeError('the Tempo Lab page did not load')
         import webview  # noqa: F401
         if os.name == 'nt':
             import clr  # noqa: F401  (pythonnet)
@@ -742,7 +646,6 @@ def main():
     ap.add_argument('--port', type=int, default=0, help='engine port (default: random free port)')
     ap.add_argument('--debug', action='store_true', help='console + developer tools (right-click → Inspect)')
     ap.add_argument('--selftest', action='store_true', help='check the build and exit (used by the release build)')
-    ap.add_argument('--tempo', action='store_true', help='also open the Tempo Lab window at start-up')
     args, _unknown = ap.parse_known_args()
 
     log_path = setup_logging(to_console=args.headless)
@@ -764,7 +667,7 @@ def main():
 def run(args, log_path):
     hide_child_consoles()
 
-    proceed, lock = acquire_instance_lock(b'tempo' if args.tempo else b'focus')
+    proceed, lock = acquire_instance_lock()
     if not proceed:
         return 0
     if lock is not None:
@@ -777,7 +680,6 @@ def run(args, log_path):
     threading.Thread(target=warm_up, daemon=True).start()
     threading.Thread(target=tools.update_if_due, daemon=True).start()
     url = f'http://127.0.0.1:{port}/'
-    STATE['url'] = url
 
     if args.headless:
         server.banner(port)
@@ -805,7 +707,6 @@ def run(args, log_path):
         background_color='#080810', text_select=True)
     api._window = window
     STATE['window'] = window
-    STATE['api'] = api
     bind_native_drop(window, server)
 
     def on_shown():
@@ -819,17 +720,8 @@ def run(args, log_path):
                 'Quit BeatSync?', 'A render is still running. Quit anyway?'))
         return True
 
-    def on_closed():                                    # closing BeatSync also closes Tempo Lab
-        w = STATE.get('tempo')
-        if w is not None:
-            try:
-                w.destroy()
-            except Exception:
-                pass
-
     window.events.shown += on_shown
     window.events.closing += on_closing
-    window.events.closed += on_closed
 
     def watchdog():
         time.sleep(45)
@@ -856,8 +748,6 @@ def run(args, log_path):
             opts['icon'] = str(tools.resource_dir() / 'assets' / 'beatsync.png')
         elif not tools.FROZEN:
             opts['icon'] = str(tools.resource_dir() / 'assets' / 'beatsync.ico')
-        if args.tempo:
-            opts['func'] = lambda: open_tempo_window(server)
         webview.start(gui='edgechromium' if os.name == 'nt' else None, debug=args.debug,
                       private_mode=True, **opts)
     except Exception as e:

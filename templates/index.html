@@ -123,10 +123,6 @@
   .trim-toggle:hover { color: var(--text); }
   .badge { margin-left: auto; font-size: 10px; color: var(--info); letter-spacing: .02em; text-transform: none; white-space: nowrap; }
   .badge:not(.hidden) + .trim-toggle { margin-left: 8px; }
-  .tl-open { margin-left: auto; background: none; border: none; color: var(--accent2); font-size: 10px; letter-spacing: .08em; cursor: pointer; padding: 0 2px; white-space: nowrap; }
-  .tl-open:hover { color: var(--text); }
-  .badge:not(.hidden) + .tl-open { margin-left: 8px; }
-  .tl-open + .trim-toggle { margin-left: 10px; }
   .trim-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
   .trim-row input { width: 62px; padding: 4px 7px; font-size: 11px; }
   .trim-row span { font-size: 10px; color: var(--muted); }
@@ -364,7 +360,7 @@
       </section>
 
       <section class="card src-card" id="card-song" data-src="song">
-        <div class="card-label"><span class="step-no">2</span><span class="dot" style="background:var(--accent2)"></span>Song<span class="badge hidden" id="song-badge"></span><button class="tl-open" id="open-tempo" title="Tempo Lab: see the song's BPM curve, cut the part you want, change its BPM — then send it back here">&#9833; Tempo Lab</button><button class="trim-toggle" data-trim="song" title="Use only part of the song">Trim &#9656;</button></div>
+        <div class="card-label"><span class="step-no">2</span><span class="dot" style="background:var(--accent2)"></span>Song<span class="badge hidden" id="song-badge"></span><button class="trim-toggle" data-trim="song" title="Use only part of the song">Trim &#9656;</button></div>
         <div class="seg full" data-srcmode="song"><button data-mode="url" class="on">Link</button><button data-mode="file">File</button></div>
         <div id="song-url-panel">
           <div class="input-row">
@@ -973,16 +969,6 @@
       clearTimeout(S.dropT);
       S.dropT = setTimeout(() => { const d = S.drop; S.drop = null; if (d) assignDrops(d.files, d.target, false); }, 1500);
     } else assignDrops(files, target, false);
-  });
-  // Tempo Lab window → "Use in BeatSync": its export becomes the song here
-  window.beatsyncUseSong = item => {
-    if (!item || !item.ok) return;
-    useFile('song', item);
-    toast('Song from Tempo Lab: ' + item.name);
-  };
-  $('open-tempo').addEventListener('click', () => {
-    if (isDesktop() && api().open_tempo_lab) api().open_tempo_lab();
-    else window.open('/tempo', '_blank');
   });
   window.beatsyncNativeDrop = items => {
     const d = S.drop; S.drop = null; clearTimeout(S.dropT);
