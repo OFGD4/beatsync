@@ -2849,6 +2849,12 @@ def api_bpm():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── Tempo Lab (second window): tempo curve, part extraction, BPM change ──────
+import sys as _sys
+import tempo_lab
+tempo_lab.attach(app, _sys.modules[__name__])
+
+
 def banner(port):
     rt = 'deno' if tools.find('deno') else 'node' if tools.find('node') else None
     print('=' * 60)

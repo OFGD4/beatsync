@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.8.0
+
+**New: Tempo Lab** — a second window (Song card → **♩ Tempo Lab**, or the *Tempo Lab* Start-menu shortcut).
+- Load a song from a **link** (yt-dlp) or a **file** / drop.
+- **Tempo curve:** the BPM over time, not one number — songs that speed up or slow down (live bands, rubato
+  intros, a 72 → 98 BPM build) are split into sections. ÷2 / ×2 / **Tap** (or press T) fix half- or
+  double-time detection.
+- **Pick a part:** drag across the graph, drag the orange edges, click a section, or type start / end.
+  Snap to beats for clean loops. Space plays the part (it loops).
+- **Change the BPM** of the part, or just cut it:
+  - *Lock every beat* — every beat plays at the target BPM (speed-ups and slow-downs are flattened, one pass,
+    Rubber Band time map).
+  - *Keep changes* — one speed for the whole part; its own tempo changes stay.
+  - Pitch: keep it, or let it follow the speed (nightcore / slowed).
+  - MP3 / WAV / FLAC / M4A. The result's BPM is measured and shown.
+- **Use in BeatSync** sends the result to the main window as the song.
+- `BeatSync.exe --tempo` opens Tempo Lab at start-up (or in the running copy).
+
 ## 3.7.0
 
 **Changed**

@@ -15,7 +15,7 @@ AppId={{8C1B8A3E-5B7E-4F1B-9D3A-2B6F0E7C4A11}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=OFGD
+AppPublisher=OFGD4
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
 DefaultDirName={localappdata}\Programs\{#AppName}
@@ -50,6 +50,7 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{autoprograms}\Tempo Lab"; Filename: "{app}\{#AppExe}"; Parameters: "--tempo"; Comment: "BeatSync Tempo Lab: tempo curve, cut a part, change BPM"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]

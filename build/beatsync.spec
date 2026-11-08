@@ -16,7 +16,7 @@ a = Analysis(
     [os.path.join(ROOT, 'desktop.py')],
     pathex=[ROOT],
     datas=datas,
-    hiddenimports=['server', 'tools', 'app_info'] + collect_submodules('librosa'),
+    hiddenimports=['server', 'tools', 'app_info', 'tempo_lab'] + collect_submodules('librosa'),
     excludes=['matplotlib', 'tkinter', 'IPython', 'pandas', 'pytest', 'yt_dlp', 'notebook',
               'sphinx', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6'],
     # numba caches compiled code next to the source; ship librosa's .py files so

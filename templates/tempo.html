@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tempo Lab</title>
+<style>
+  @font-face { font-family: 'Bebas Neue'; src: url('/assets/fonts/bebas-neue-latin-400-normal.woff2') format('woff2'); font-weight: 400; font-display: block; }
+  @font-face { font-family: 'DM Mono'; src: url('/assets/fonts/dm-mono-latin-300-normal.woff2') format('woff2'); font-weight: 300; font-display: block; }
+  @font-face { font-family: 'DM Mono'; src: url('/assets/fonts/dm-mono-latin-400-normal.woff2') format('woff2'); font-weight: 400; font-display: block; }
+  @font-face { font-family: 'DM Mono'; src: url('/assets/fonts/dm-mono-latin-500-normal.woff2') format('woff2'); font-weight: 500; font-display: block; }
+  :root {
+    --bg: #080810; --surface: #0f0f1a; --surface2: #13131f; --border: #1f1f33; --border2: #2a2a42;
+    --accent: #ff2d6b; --accent2: #ff8c2d; --text: #e0e0f0; --muted: #6a6a88; --dim: #44445a;
+    --success: #2dffb0; --info: #2d9fff; --warn: #ffcc2d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: var(--bg); color: var(--text); font: 400 12px/1.35 'DM Mono', monospace; -webkit-font-smoothing: antialiased; user-select: none; }
+  body::before { content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background: radial-gradient(ellipse 55% 45% at 10% 6%, rgba(255,140,45,0.06) 0%, transparent 60%),
+                radial-gradient(ellipse 50% 50% at 90% 94%, rgba(255,45,107,0.06) 0%, transparent 60%); }
+  button { font-family: inherit; color: inherit; }
+  input { font-family: inherit; user-select: text; }
+  :focus { outline: none; }
+  :focus-visible { outline: 1px solid var(--info); outline-offset: 1px; }
+  .hidden { display: none !important; }
+  .spacer { flex: 1; }
+  .ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .caps { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+  .dimtxt { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  #app { position: relative; z-index: 1; height: 100vh; display: flex; flex-direction: column; gap: 10px; padding: 10px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px 10px; }
+  .row { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+
+  /* header */
+  .top { display: flex; align-items: center; gap: 12px; }
+  .logo { font-family: 'Bebas Neue', sans-serif; font-size: 30px; line-height: 1; letter-spacing: 3px; white-space: nowrap;
+          background: linear-gradient(135deg, var(--accent2), var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .src { flex: 1; display: flex; gap: 6px; min-width: 0; }
+  input[type="text"], input[type="number"] { min-width: 0; background: var(--bg); border: 1px solid var(--border2); color: var(--text); font-size: 12px; padding: 6px 9px; border-radius: 5px; transition: border-color .15s; }
+  input[type="text"]:focus, input[type="number"]:focus { border-color: var(--accent2); }
+  input::placeholder { color: var(--dim); }
+  #url { flex: 1; }
+
+  .btn-ghost { background: transparent; border: 1px solid var(--border2); color: var(--muted); font-size: 11px; padding: 6px 11px; cursor: pointer; border-radius: 5px; letter-spacing: .04em; transition: all .15s; white-space: nowrap; }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--accent2); color: var(--accent2); }
+  .btn-ghost:disabled { opacity: .35; cursor: default; }
+  .btn-ghost.on { border-color: var(--accent2); color: var(--accent2); }
+  .btn-main { background: linear-gradient(135deg, var(--accent2), var(--accent)); border: none; color: #fff; font: 400 18px/1 'Bebas Neue', sans-serif; letter-spacing: 2px; padding: 9px 22px 7px; border-radius: 6px; cursor: pointer; white-space: nowrap; transition: filter .15s, opacity .15s; }
+  .btn-main:hover:not(:disabled) { filter: brightness(1.12); }
+  .btn-main:disabled { opacity: .35; cursor: default; }
+
+  .seg { display: inline-flex; border: 1px solid var(--border2); border-radius: 5px; overflow: hidden; flex-shrink: 0; }
+  .seg button { background: transparent; border: none; color: var(--muted); font-size: 11px; letter-spacing: .04em; padding: 5px 10px; cursor: pointer; transition: background .12s, color .12s; white-space: nowrap; }
+  .seg button + button { border-left: 1px solid var(--border2); }
+  .seg button:hover:not(.on) { color: var(--text); background: rgba(255,255,255,.03); }
+  .seg button.on { background: var(--accent2); color: #000; }
+  .seg.pink button.on { background: var(--accent); color: #fff; }
+  .seg.blue button.on { background: var(--info); color: #000; }
+  .seg.plain button.on { background: transparent; color: var(--muted); }
+
+  .error-msg { background: rgba(255,45,107,.08); border: 1px solid var(--accent); color: var(--accent); padding: 7px 28px 7px 10px; border-radius: 6px; font-size: 11px; position: relative; line-height: 1.5; user-select: text; }
+  .error-msg button { position: absolute; top: 3px; right: 6px; background: none; border: none; color: var(--accent); font-size: 15px; cursor: pointer; }
+
+  /* song card */
+  #song { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+  .songhead { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
+  .big { font-family: 'Bebas Neue', sans-serif; font-size: 44px; line-height: .9; letter-spacing: 1px; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .big .unit { font-size: 17px; color: var(--muted); margin-left: 6px; letter-spacing: 2px; }
+  .big .arrow { color: var(--accent2); margin: 0 4px; }
+  .meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding-bottom: 2px; }
+  .name { font-size: 12px; color: var(--text); }
+  .sub { font-size: 11px; color: var(--muted); }
+  .loading { display: flex; align-items: center; gap: 8px; color: var(--accent2); font-size: 11px; }
+  .spinner { width: 10px; height: 10px; border: 2px solid var(--border2); border-top-color: var(--accent2); border-radius: 50%; animation: spin .7s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tap-n { min-width: 64px; text-align: left; }
+
+  .chips { display: flex; gap: 5px; overflow-x: auto; min-height: 24px; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { flex-shrink: 0; background: var(--surface2); border: 1px solid var(--border2); color: var(--muted); border-radius: 12px; padding: 3px 10px; font-size: 10.5px; cursor: pointer; white-space: nowrap; transition: all .12s; }
+  .chip b { color: var(--text); font-weight: 500; }
+  .chip:hover { border-color: var(--accent2); color: var(--text); }
+  .chip.on { border-color: var(--accent2); background: rgba(255,140,45,.12); color: var(--text); }
+
+  .graph { position: relative; flex: 1 1 auto; min-height: 150px; border-radius: 6px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; cursor: crosshair; }
+  .graph canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; color: var(--dim); font-size: 11px; text-align: center; pointer-events: none; }
+  .empty .bigtxt { font: 400 22px/1 'Bebas Neue', sans-serif; letter-spacing: 2px; color: var(--muted); }
+  body.dragging .graph { border-color: var(--accent2); box-shadow: 0 0 0 1px var(--accent2) inset; }
+  .tip { position: absolute; top: 6px; pointer-events: none; background: rgba(8,8,16,.92); border: 1px solid var(--border2); border-radius: 4px; padding: 3px 7px; font-size: 10.5px; white-space: nowrap; color: var(--text); }
+
+  .part input.time { width: 82px; text-align: center; font-variant-numeric: tabular-nums; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
+  .chk input { accent-color: var(--accent2); width: 13px; height: 13px; cursor: pointer; }
+
+  /* output card */
+  #out { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  .chk.lead { color: var(--text); font-size: 12px; }
+  #target { width: 78px; font-size: 14px; text-align: center; padding: 5px 6px; }
+  .plan { font-size: 11px; color: var(--muted); min-height: 15px; }
+  .plan b { color: var(--accent2); font-weight: 500; }
+  .plan .warn { color: var(--warn); }
+  #out.off .needs-bpm { opacity: .35; pointer-events: none; }
+  .progress { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .progress div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent2), var(--accent)); transition: width .3s; }
+  .result { display: flex; align-items: center; gap: 8px; background: rgba(45,255,176,.05); border: 1px solid rgba(45,255,176,.25); border-radius: 6px; padding: 6px 8px; min-width: 0; }
+  .result .ok { color: var(--success); }
+  .result .ell { color: var(--text); }
+
+  .grp { display: inline-flex; align-items: center; gap: 8px; }
+  .toast { position: fixed; left: 50%; top: 12px; transform: translateX(-50%) translateY(-12px); opacity: 0; background: var(--surface2); border: 1px solid var(--border2); color: var(--text); padding: 7px 14px; border-radius: 6px; font-size: 11px; z-index: 10; transition: all .2s; pointer-events: none; max-width: 80vw; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.good { border-color: rgba(45,255,176,.5); }
+  .toast.bad { border-color: var(--accent); color: var(--accent); }
+  kbd { font-family: inherit; font-size: 10px; border: 1px solid var(--border2); border-radius: 3px; padding: 0 4px; color: var(--muted); }
+
+  @media (max-width: 760px) { .logo { font-size: 24px; } .big { font-size: 34px; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div class="logo">TEMPO LAB</div>
+    <div class="src">
+      <input type="text" id="url" placeholder="Paste a link — YouTube, SoundCloud, any site…" autocomplete="off" spellcheck="false" aria-label="Song link">
+      <button class="btn-ghost" id="load-url">Load</button>
+      <button class="btn-ghost" id="pick">Choose file</button>
+      <input type="file" id="file" hidden accept=".mp3,.wav,.flac,.aac,.ogg,.m4a,.opus,.mp4,.mkv,.webm,.mov,.avi,.m4v">
+    </div>
+  </header>
+
+  <div class="error-msg hidden" id="err"><span id="err-text"></span><button id="err-x" aria-label="Close">&times;</button></div>
+
+  <!-- ─── Song: tempo curve and the part to use ─────────────────────────── -->
+  <section class="card" id="song">
+    <div class="songhead">
+      <div class="big" id="bpm-big">&mdash;<span class="unit">BPM</span></div>
+      <div class="meta">
+        <div class="name ell" id="song-name">No song loaded</div>
+        <div class="sub ell" id="bpm-sub">Paste a link or drop an audio / video file</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="loading hidden" id="loading"><span class="spinner"></span><span id="load-msg"></span></div>
+      <div class="row" id="fix" style="flex-wrap:nowrap">
+        <span class="dimtxt tap-n" id="tap-n"></span>
+        <div class="seg plain">
+          <button data-f="0.5" title="The tempo was detected twice too fast">&divide;2</button>
+          <button data-f="2" title="The tempo was detected twice too slow">&times;2</button>
+          <button id="tap" title="Tap along with the beat (or press T) to correct the tempo">Tap</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="chips" id="chips"></div>
+
+    <div class="graph" id="graph">
+      <canvas id="cv"></canvas>
+      <div class="empty" id="empty"><div class="bigtxt">Drop a song here</div><div>The BPM curve shows where the song speeds up or slows down.<br>Drag across it to pick the part you want.</div></div>
+      <div class="tip hidden" id="tip"></div>
+    </div>
+
+    <div class="row part">
+      <span class="caps">Part</span>
+      <input type="text" class="time" id="p-start" placeholder="0:00" aria-label="Part start">
+      <span class="dimtxt">&rarr;</span>
+      <input type="text" class="time" id="p-end" placeholder="end" aria-label="Part end">
+      <span class="dimtxt" id="p-len"></span>
+      <button class="btn-ghost" id="p-whole" title="Use the whole song (double-click the graph to pick one section)">Whole song</button>
+      <label class="chk" title="Start and end land exactly on a beat (clean loops)"><input type="checkbox" id="snap" checked>Snap to beats</label>
+      <div class="spacer"></div>
+      <span class="dimtxt"><kbd>Space</kbd> play</span>
+      <button class="btn-ghost" id="play" disabled>&#9654; Play part</button>
+    </div>
+  </section>
+
+  <!-- ─── Output ────────────────────────────────────────────────────────── -->
+  <section class="card" id="out">
+    <div class="row">
+      <label class="chk lead"><input type="checkbox" id="change" checked>Change BPM to</label>
+      <input type="number" id="target" value="100" step="0.1" min="20" max="400" class="needs-bpm" aria-label="Target BPM">
+      <div class="seg needs-bpm" id="presets"><button>90</button><button>100</button><button>120</button><button>128</button><button>140</button></div>
+      <div class="spacer"></div>
+      <span class="grp needs-bpm"><span class="caps">Tempo</span>
+      <div class="seg pink" id="mode">
+        <button data-m="lock" class="on" title="Every beat of the part plays at the target BPM — speed-ups and slow-downs are evened out">Lock every beat</button>
+        <button data-m="scale" title="One speed for the whole part — its own speed-ups and slow-downs stay">Keep changes</button>
+      </div></span>
+      <span class="grp needs-bpm"><span class="caps">Pitch</span>
+      <div class="seg" id="pitch">
+        <button data-p="keep" class="on" title="Same key, only the speed changes">Keep</button>
+        <button data-p="follow" title="Faster = higher, slower = lower (nightcore / slowed)">Follow speed</button>
+      </div></span>
+    </div>
+    <div class="plan" id="plan">Load a song to begin.</div>
+    <div class="row">
+      <span class="caps">Format</span>
+      <div class="seg blue" id="fmt"><button data-f="mp3" class="on">MP3</button><button data-f="wav">WAV</button><button data-f="flac">FLAC</button><button data-f="m4a">M4A</button></div>
+      <div class="spacer"></div>
+      <span class="dimtxt hidden" id="ex-msg"></span>
+      <button class="btn-main" id="export" disabled>Export</button>
+    </div>
+    <div class="progress hidden" id="ex-prog"><div></div></div>
+    <div class="result hidden" id="result">
+      <span class="ok">&#10003;</span><span class="ell" id="res-name"></span><span class="dimtxt" id="res-meta"></span>
+      <div class="spacer"></div>
+      <button class="btn-ghost" id="res-play">&#9654; Play</button>
+      <button class="btn-ghost" id="res-save">Save&hellip;</button>
+      <button class="btn-ghost hidden" id="res-use" title="Send this to the BeatSync window as the song">Use in BeatSync</button>
+    </div>
+  </section>
+  <audio id="audio" preload="auto"></audio>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id), $$ = s => Array.from(document.querySelectorAll(s));
+  const api = () => (window.pywebview && window.pywebview.api) || null;
+  const isDesktop = () => !!(api() && api().tempo_save);
+  const AUDIO_EXT = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.opus'];
+  const VIDEO_EXT = ['.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v'];
+  const S = { sid: null, an: null, scale: 1, sel: null, mode: 'lock', pitch: 'keep', fmt: 'mp3', gen: 0,
+              playing: null, taps: [], hover: null, drag: null, resultGen: 0, poll: null };
+
+  // ── small helpers ──────────────────────────────────────────────────────
+  const fmtT = (t, dec) => { t = Math.max(0, t || 0); const m = Math.floor(t / 60), s = t - m * 60;
+    return m + ':' + (dec ? s.toFixed(1).padStart(4, '0') : String(Math.floor(s)).padStart(2, '0')); };
+  const parseT = v => { v = String(v || '').trim(); if (!v) return null;
+    const p = v.split(':').map(Number); if (p.some(isNaN)) return null;
+    return p.reduce((a, x) => a * 60 + x, 0); };
+  const r1 = x => Math.round(x * 10) / 10;
+  const bpmTxt = x => (Math.abs(x - Math.round(x)) < 0.05 ? Math.round(x) : r1(x).toFixed(1));
+  let toastT = null;
+  function toast(msg, tone) { const t = $('toast'); t.textContent = msg; t.className = 'toast show ' + (tone || '');
+    clearTimeout(toastT); toastT = setTimeout(() => t.className = 'toast', 3200); }
+  function showErr(m) { $('err-text').textContent = m; $('err').classList.remove('hidden'); }
+  function hideErr() { $('err').classList.add('hidden'); }
+  $('err-x').onclick = hideErr;
+  async function postJSON(url, body) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+    return d;
+  }
+  const store = { get(k, d) { try { const v = localStorage.getItem('tempolab.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+                  set(k, v) { try { localStorage.setItem('tempolab.' + k, JSON.stringify(v)); } catch (e) {} } };
+
+  // ── tempo curve maths (scaled by ÷2 / ×2 / tap) ────────────────────────
+  function bpmAt(t) {
+    const T = S.an.times, B = S.an.bpm;
+    if (t <= T[0]) return B[0] * S.scale;
+    if (t >= T[T.length - 1]) return B[B.length - 1] * S.scale;
+    let lo = 0, hi = T.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (T[m] <= t) lo = m; else hi = m; }
+    const f = (t - T[lo]) / (T[hi] - T[lo]);
+    return (B[lo] + (B[hi] - B[lo]) * f) * S.scale;
+  }
+  function partStats(a, b) {
+    const n = 300; let sum = 0, lo = 1e9, hi = 0, outLen = 0; const tgt = +$('target').value || 100;
+    for (let i = 0; i < n; i++) { const t = a + (b - a) * (i + .5) / n, v = bpmAt(t);
+      sum += v; lo = Math.min(lo, v); hi = Math.max(hi, v); outLen += (b - a) / n * v / tgt; }
+    return { avg: sum / n, lo, hi, lockLen: outLen };
+  }
+  function nearestBeat(t) {
+    const B = S.an.beats; if (!B || !B.length) return t;
+    let best = B[0]; for (const x of B) { if (Math.abs(x - t) < Math.abs(best - t)) best = x; if (x > t + 2) break; }
+    return Math.abs(best - t) < 0.6 ? best : t;
+  }
+
+  // ── loading ────────────────────────────────────────────────────────────
+  function setLoading(on, msg) {
+    $('loading').classList.toggle('hidden', !on); $('load-msg').textContent = msg || '';
+    $('load-url').disabled = on && !!S.loadingUrl;
+  }
+  async function load(body, label) {
+    hideErr(); stopAudio();
+    S.loadingUrl = !!body.url;
+    setLoading(true, 'Starting…');
+    $('song-name').textContent = label || 'Loading…';
+    try {
+      const d = await postJSON('/api/tempo/load', body);
+      S.sid = d.sid; S.an = null; S.sel = null; S.scale = 1; S.resultGen = 0;
+      $('result').classList.add('hidden'); render(); draw();
+      pollLoad(d.sid);
+    } catch (e) { setLoading(false); showErr(e.message); }
+  }
+  function pollLoad(sid) {
+    clearTimeout(S.poll);
+    const tick = async () => {
+      if (sid !== S.sid) return;
+      let d; try { d = await (await fetch('/api/tempo/status/' + sid + '?full=1')).json(); } catch (e) { S.poll = setTimeout(tick, 800); return; }
+      if (sid !== S.sid) return;
+      if (d.error && d.state !== 'loading') { setLoading(false); showErr(d.error); $('song-name').textContent = 'No song loaded'; return; }
+      if (d.state === 'ready') {
+        setLoading(false); S.an = d.analysis; S.name = d.name;
+        S.sel = { a: 0, b: S.an.duration };
+        $('audio').src = '/api/tempo/media/' + sid + '/source';
+        render(); draw();
+        return;
+      }
+      setLoading(true, d.msg || 'Working…');
+      S.poll = setTimeout(tick, 400);
+    };
+    tick();
+  }
+  $('load-url').onclick = () => { const u = $('url').value.trim(); if (u) load({ url: u }, u); };
+  $('url').addEventListener('keydown', e => { if (e.key === 'Enter') $('load-url').click(); });
+  $('url').addEventListener('paste', () => setTimeout(() => { const u = $('url').value.trim(); if (/^https?:\/\//i.test(u)) $('load-url').click(); }, 60));
+
+  async function pickFile() {
+    if (isDesktop() && api().pick_file) {
+      try { const r = await api().pick_file('vid');
+        if (!r || r.cancelled) return; if (!r.ok) throw new Error(r.error || 'Could not open that file.');
+        load({ file_id: r.file_id }, r.name);
+      } catch (e) { showErr(e.message || String(e)); }
+    } else $('file').click();
+  }
+  $('pick').onclick = pickFile;
+  $('file').onchange = () => { const f = $('file').files[0]; $('file').value = ''; if (f) uploadThenLoad(f); };
+  function uploadThenLoad(file) {
+    hideErr(); setLoading(true, 'Adding ' + file.name + '…'); $('song-name').textContent = file.name;
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = e => { if (e.lengthComputable) setLoading(true, 'Adding ' + Math.round(e.loaded / e.total * 100) + '%'); };
+    xhr.onload = () => { let d = {}; try { d = JSON.parse(xhr.responseText); } catch (e) {}
+      if (xhr.status !== 200 || d.error) { setLoading(false); showErr(d.error || 'Could not add the file.'); return; }
+      load({ file_id: d.file_id }, d.name || file.name); };
+    xhr.onerror = () => { setLoading(false); showErr('Could not add the file.'); };
+    xhr.send(file);
+  }
+
+  // drag & drop: the desktop app hands over the real path (no copy); the browser uploads
+  let dragClear = null, pendingDrop = null, dropT = null;
+  document.addEventListener('dragover', e => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; document.body.classList.add('dragging');
+    clearTimeout(dragClear); dragClear = setTimeout(() => document.body.classList.remove('dragging'), 160);
+  });
+  document.addEventListener('drop', e => {
+    if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+    e.preventDefault(); document.body.classList.remove('dragging');
+    const f = e.dataTransfer.files[0], ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
+    if (!AUDIO_EXT.includes(ext) && !VIDEO_EXT.includes(ext)) { showErr('Unsupported file type: ' + ext); return; }
+    if (isDesktop() && window.beatsyncNativeDropReady) {
+      pendingDrop = f; clearTimeout(dropT);
+      dropT = setTimeout(() => { const p = pendingDrop; pendingDrop = null; if (p) uploadThenLoad(p); }, 1500);
+    } else uploadThenLoad(f);
+  });
+  window.beatsyncNativeDrop = items => {
+    pendingDrop = null; clearTimeout(dropT);
+    const ok = (items || []).filter(i => i.ok);
+    if (ok.length) load({ file_id: ok[0].file_id }, ok[0].name);
+    else if (items && items[0]) showErr(items[0].error || 'Could not open that file.');
+  };
+
+  // ── header numbers, section chips, part fields, plan ───────────────────
+  function render() {
+    const an = S.an, has = !!an;
+    $('empty').classList.toggle('hidden', has);
+    $('play').disabled = !has; $('export').disabled = !has;
+    if (!has) { $('bpm-big').innerHTML = '&mdash;<span class="unit">BPM</span>'; $('chips').innerHTML = ''; $('bpm-sub').textContent = S.sid ? 'Finding the tempo…' : 'Paste a link or drop an audio / video file'; renderPlan(); return; }
+    $('song-name').textContent = S.name; $('song-name').title = S.name;
+    const secs = an.sections, k = S.scale;
+    const lo = an.range[0] * k, hi = an.range[1] * k;
+    if (an.steady) {
+      $('bpm-big').innerHTML = bpmTxt(an.summary * k) + '<span class="unit">BPM</span>';
+      $('bpm-sub').textContent = 'Steady tempo  ·  ' + fmtT(an.duration) + '  ·  ÷2 / ×2 if it feels half or double';
+    } else if (secs.length > 1) {
+      $('bpm-big').innerHTML = bpmTxt(secs[0].bpm * k) + '<span class="arrow">&rarr;</span>' + bpmTxt(secs[secs.length - 1].bpm * k) + '<span class="unit">BPM</span>';
+      $('bpm-sub').textContent = 'Tempo changes  ·  ' + secs.length + ' sections  ·  range ' + bpmTxt(lo) + '–' + bpmTxt(hi) + '  ·  ' + fmtT(an.duration);
+    } else {
+      $('bpm-big').innerHTML = bpmTxt(an.summary * k) + '<span class="unit">BPM</span>';
+      $('bpm-sub').textContent = 'Drifts ' + bpmTxt(lo) + '–' + bpmTxt(hi) + '  ·  ' + fmtT(an.duration);
+    }
+    const ch = $('chips'); ch.innerHTML = '';
+    if (secs.length > 1) secs.forEach((s, i) => {
+      const b = document.createElement('button'); b.className = 'chip';
+      const arrow = s.trend === 'up' ? ' ↗' : s.trend === 'down' ? ' ↘' : '';
+      b.innerHTML = fmtT(s.t0) + '–' + fmtT(s.t1) + ' &nbsp;<b>' + bpmTxt(s.bpm * k) + '</b>' + arrow;
+      b.title = 'Section ' + (i + 1) + ': ' + bpmTxt(s.lo * k) + '–' + bpmTxt(s.hi * k) + ' BPM. Click to use this part.';
+      b.onclick = () => setSel(s.t0, s.t1, false);
+      ch.appendChild(b);
+    });
+    syncSelUI(); renderPlan();
+  }
+  function syncSelUI() {
+    if (!S.an || !S.sel) return;
+    const { a, b } = S.sel;
+    if (document.activeElement !== $('p-start')) $('p-start').value = fmtT(a, true);
+    if (document.activeElement !== $('p-end')) $('p-end').value = fmtT(b, true);
+    const whole = a < 0.05 && b > S.an.duration - 0.05;
+    $('p-len').textContent = whole ? 'whole song' : fmtT(b - a, true) + ' long';
+    $$('.chip').forEach((c, i) => { const s = S.an.sections[i]; c.classList.toggle('on', Math.abs(s.t0 - a) < 0.6 && Math.abs(s.t1 - b) < 0.6); });
+    $('export').textContent = $('change').checked ? 'Export at ' + bpmTxt(+$('target').value || 0) + ' BPM' : (whole ? 'Export song' : 'Export part');
+  }
+  function setSel(a, b, snap) {
+    const D = S.an.duration;
+    a = Math.max(0, Math.min(D, a)); b = Math.max(0, Math.min(D, b));
+    if (b < a) [a, b] = [b, a];
+    if (snap && $('snap').checked) { a = a < 0.05 ? 0 : nearestBeat(a); b = b > D - 0.05 ? D : nearestBeat(b); }
+    if (b - a < 0.5) b = Math.min(D, a + 0.5);
+    S.sel = { a, b }; syncSelUI(); renderPlan(); draw();
+    if (S.playing === 'part') playPart(true);
+  }
+  ['p-start', 'p-end'].forEach(id => $(id).addEventListener('change', () => {
+    if (!S.an) return; const v = parseT($(id).value);
+    if (v === null) { syncSelUI(); return; }
+    id === 'p-start' ? setSel(v, S.sel.b, false) : setSel(S.sel.a, v, false);
+  }));
+  $('p-whole').onclick = () => S.an && setSel(0, S.an.duration, false);
+
+  function renderPlan() {
+    const p = $('plan'), change = $('change').checked;
+    $('out').classList.toggle('off', !change);
+    if (!S.an || !S.sel) { p.textContent = 'Load a song to begin.'; return; }
+    const { a, b } = S.sel, st = partStats(a, b), tgt = +$('target').value || 0, len = b - a;
+    if (!change) { p.innerHTML = 'Cut only — the part keeps its own tempo (≈ <b>' + bpmTxt(st.avg) + ' BPM</b>), ' + fmtT(len, true) + ' long.'; syncSelUI(); return; }
+    if (!(tgt >= 20 && tgt <= 400)) { p.innerHTML = '<span class="warn">Target BPM must be between 20 and 400.</span>'; return; }
+    let html, rLo, rHi, outLen;
+    if (S.mode === 'lock') {
+      rLo = tgt / st.hi; rHi = tgt / st.lo; outLen = st.lockLen;
+      const varies = st.hi / st.lo > 1.02;
+      html = (varies ? 'Every beat <b>' + bpmTxt(st.lo) + '–' + bpmTxt(st.hi) + '</b>' : 'This part <b>' + bpmTxt(st.avg) + '</b>') +
+             ' → <b>' + bpmTxt(tgt) + ' BPM</b> flat  ·  speed ' + (varies ? rLo.toFixed(2) + '×–' + rHi.toFixed(2) + '×' : (tgt / st.avg).toFixed(3) + '×');
+    } else {
+      rLo = rHi = tgt / st.avg; outLen = len / rLo;
+      html = 'This part <b>' + bpmTxt(st.avg) + '</b> (avg) → <b>' + bpmTxt(tgt) + ' BPM</b>  ·  speed ' + rLo.toFixed(3) + '×' +
+             (st.hi / st.lo > 1.02 ? '  ·  its changes stay (' + bpmTxt(st.lo * rLo) + '–' + bpmTxt(st.hi * rLo) + ')' : '');
+    }
+    html += '  ·  ≈ ' + fmtT(outLen, true) + ' long' + (S.pitch === 'follow' ? '  ·  pitch moves with speed' : '');
+    if (rHi > 1.6 || rLo < 0.625) {
+      const half = st.avg / 2, dbl = st.avg * 2;
+      const better = Math.abs(Math.log(tgt / half)) < Math.abs(Math.log(tgt / dbl)) ? '÷2' : '×2';
+      html += '  ·  <span class="warn">big change — if the song feels ' + (better === '÷2' ? 'half as fast' : 'twice as fast') + ', press ' + better + '</span>';
+    }
+    p.innerHTML = html; syncSelUI();
+  }
+
+  // ── output options ─────────────────────────────────────────────────────
+  function segPick(id, attr, key, val) {
+    $$('#' + id + ' button').forEach(b => b.classList.toggle('on', b.dataset[attr] === val));
+    S[key] = val; store.set(key, val); renderPlan(); draw();
+  }
+  $('mode').onclick = e => { const b = e.target.closest('button'); if (b) segPick('mode', 'm', 'mode', b.dataset.m); };
+  $('pitch').onclick = e => { const b = e.target.closest('button'); if (b) segPick('pitch', 'p', 'pitch', b.dataset.p); };
+  $('fmt').onclick = e => { const b = e.target.closest('button'); if (b) segPick('fmt', 'f', 'fmt', b.dataset.f); };
+  $('presets').onclick = e => { const b = e.target.closest('button'); if (b) { $('target').value = b.textContent; onTarget(); } };
+  function onTarget() { store.set('target', $('target').value); $$('#presets button').forEach(b => b.classList.toggle('on', +b.textContent === +$('target').value)); renderPlan(); draw(); }
+  $('target').addEventListener('input', onTarget);
+  $('change').addEventListener('change', () => { store.set('change', $('change').checked); renderPlan(); draw(); });
+
+  // ÷2 / ×2 / tap
+  $('fix').addEventListener('click', e => {
+    const b = e.target.closest('button[data-f]'); if (!b || !S.an) return;
+    S.scale *= +b.dataset.f; render(); draw();
+    toast('Song tempo ' + (b.dataset.f === '2' ? 'doubled' : 'halved') + ' — ' + $('bpm-big').textContent.replace('BPM', ' BPM'));
+  });
+  function tap() {
+    if (!S.an) return;
+    const now = performance.now();
+    if (S.taps.length && now - S.taps[S.taps.length - 1] > 2000) S.taps = [];
+    S.taps.push(now); S.taps = S.taps.slice(-9);
+    const btn = $('tap'); btn.style.color = 'var(--accent2)'; setTimeout(() => btn.style.color = '', 90);
+    if (S.taps.length < 4) { $('tap-n').textContent = 'tap ' + S.taps.length + '/4'; return; }
+    const iv = []; for (let i = 1; i < S.taps.length; i++) iv.push(S.taps[i] - S.taps[i - 1]);
+    const tapped = 60000 / (iv.reduce((x, y) => x + y, 0) / iv.length);
+    const au = $('audio'), t = S.playing === 'part' ? au.currentTime : null;
+    const raw = (t !== null ? bpmAt(t) : partStats(S.sel.a, S.sel.b).avg) / S.scale;
+    S.scale = tapped / raw;
+    $('tap-n').textContent = bpmTxt(tapped) + ' tapped';
+    render(); draw();
+  }
+  $('tap').onclick = tap;
+
+  // ── audio ──────────────────────────────────────────────────────────────
+  const au = $('audio');
+  function stopAudio() { au.pause(); S.playing = null; $('play').innerHTML = '&#9654; Play part'; $('res-play').innerHTML = '&#9654; Play'; draw(); }
+  function playPart(restart) {
+    if (!S.an) return;
+    const src = '/api/tempo/media/' + S.sid + '/source';
+    if (!au.src.endsWith(src)) au.src = src;
+    if (restart || S.playing !== 'part' || au.currentTime < S.sel.a || au.currentTime >= S.sel.b) au.currentTime = S.sel.a;
+    au.play().catch(() => {}); S.playing = 'part'; $('play').innerHTML = '&#9632; Stop'; $('res-play').innerHTML = '&#9654; Play'; loop();
+  }
+  $('play').onclick = () => S.playing === 'part' ? stopAudio() : playPart(true);
+  $('res-play').onclick = () => {
+    if (S.playing === 'result') { stopAudio(); return; }
+    au.src = '/api/tempo/media/' + S.sid + '/result?g=' + S.resultGen; au.currentTime = 0;
+    au.play().catch(() => {}); S.playing = 'result'; $('res-play').innerHTML = '&#9632; Stop'; $('play').innerHTML = '&#9654; Play part'; draw();
+  };
+  au.addEventListener('ended', stopAudio);
+  function loop() {
+    if (S.playing !== 'part') return;
+    if (au.currentTime >= S.sel.b) { au.currentTime = S.sel.a; }      // the part loops — handy for checking a cut
+    draw(); requestAnimationFrame(loop);
+  }
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') return;
+    if (e.code === 'Space') { e.preventDefault(); S.playing === 'part' ? stopAudio() : playPart(true); }
+    else if (e.key === 't' || e.key === 'T') tap();
+  });
+
+  // ── export ─────────────────────────────────────────────────────────────
+  $('export').onclick = async () => {
+    if (!S.an) return; hideErr();
+    const body = { sid: S.sid, start: S.sel.a, end: S.sel.b, change_bpm: $('change').checked, target: +$('target').value,
+                   mode: S.mode, pitch: S.pitch, format: S.fmt, scale: S.scale };
+    $('export').disabled = true; $('ex-prog').classList.remove('hidden'); $('ex-prog').firstElementChild.style.width = '2%';
+    $('ex-msg').classList.remove('hidden'); $('ex-msg').textContent = 'Starting…';
+    try { const d = await postJSON('/api/tempo/export', body); pollExport(S.sid, d.gen); }
+    catch (e) { doneExport(); showErr(e.message); }
+  };
+  function doneExport() { $('export').disabled = !S.an; $('ex-prog').classList.add('hidden'); $('ex-msg').classList.add('hidden'); }
+  function pollExport(sid, gen) {
+    const tick = async () => {
+      if (sid !== S.sid) { doneExport(); return; }
+      let d; try { d = await (await fetch('/api/tempo/status/' + sid)).json(); } catch (e) { setTimeout(tick, 800); return; }
+      const ex = d.export || {};
+      if (ex.gen !== gen) { setTimeout(tick, 400); return; }
+      if (ex.state === 'running') { $('ex-prog').firstElementChild.style.width = (ex.pct || 2) + '%'; $('ex-msg').textContent = ex.msg || ''; setTimeout(tick, 350); return; }
+      doneExport();
+      if (ex.state === 'error') { showErr(ex.error || 'Export failed.'); return; }
+      S.resultGen = gen;
+      $('res-name').textContent = ex.name; $('res-name').title = ex.name;
+      let meta = fmtT(ex.seconds, true);
+      if (ex.measured) meta += '  ·  measured ' + bpmTxt(ex.measured.summary) + ' BPM' + (ex.measured.steady ? ' steady' : ' (' + bpmTxt(ex.measured.range[0]) + '–' + bpmTxt(ex.measured.range[1]) + ')');
+      $('res-meta').textContent = meta;
+      $('result').classList.remove('hidden');
+      $('res-use').classList.toggle('hidden', !(isDesktop() && api().tempo_use));
+      toast('Ready: ' + ex.name, 'good');
+    };
+    tick();
+  }
+  $('res-save').onclick = async () => {
+    if (isDesktop()) {
+      try { const r = await api().tempo_save(S.sid);
+        if (r && r.ok) toast('Saved to ' + r.path, 'good'); else if (r && !r.cancelled) showErr(r.error || 'Could not save.');
+      } catch (e) { showErr(String(e)); }
+    } else window.location.href = '/api/tempo/download/' + S.sid;
+  };
+  $('res-use').onclick = async () => {
+    try { const r = await api().tempo_use(S.sid);
+      if (r && r.ok) toast('Sent to BeatSync as the song', 'good'); else showErr((r && r.error) || 'Could not send it.');
+    } catch (e) { showErr(String(e)); }
+  };
+
+  // ── graph ──────────────────────────────────────────────────────────────
+  const cv = $('cv'), ctx = cv.getContext('2d'), G = { l: 40, r: 10, t: 20, b: 18 };
+  function geo() {
+    const w = cv.clientWidth, h = cv.clientHeight;
+    return { w, h, x0: G.l, x1: w - G.r, y0: G.t, y1: h - G.b };
+  }
+  const tx = (g, t) => g.x0 + (g.x1 - g.x0) * t / S.an.duration;
+  const xt = (g, x) => Math.max(0, Math.min(S.an.duration, (x - g.x0) / (g.x1 - g.x0) * S.an.duration));
+  function draw() {
+    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    if (!S.an) return;
+    const g = geo(), an = S.an, k = S.scale, tgt = +$('target').value || 0, change = $('change').checked;
+    // y range: curve (+ target when it is shown)
+    let lo = Infinity, hi = -Infinity; an.bpm.forEach(v => { lo = Math.min(lo, v * k); hi = Math.max(hi, v * k); });
+    if (change && tgt >= 20 && tgt <= 400 && tgt > lo / 1.8 && tgt < hi * 1.8) { lo = Math.min(lo, tgt); hi = Math.max(hi, tgt); }
+    const pad = Math.max(4, (hi - lo) * 0.15); lo -= pad; hi += pad;
+    if (hi - lo < 16) { const m = (hi + lo) / 2; lo = m - 8; hi = m + 8; }
+    const ty = v => g.y1 - (g.y1 - g.y0) * (v - lo) / (hi - lo);
+
+    // waveform
+    const pk = an.peaks || [], mid = (g.y0 + g.y1) / 2, amp = (g.y1 - g.y0) / 2 * 0.9;
+    ctx.fillStyle = 'rgba(255,255,255,0.055)';
+    const bw = (g.x1 - g.x0) / pk.length;
+    pk.forEach((v, i) => { const hh = Math.max(0.5, v * amp); ctx.fillRect(g.x0 + i * bw, mid - hh, Math.max(1, bw), hh * 2); });
+
+    // sections
+    ctx.font = '10px "DM Mono", monospace'; ctx.textBaseline = 'top';
+    if (an.sections.length > 1) an.sections.forEach((s, i) => {
+      const xa = tx(g, s.t0), xb = tx(g, s.t1);
+      if (i % 2) { ctx.fillStyle = 'rgba(255,255,255,0.022)'; ctx.fillRect(xa, g.y0 - 16, xb - xa, g.y1 - g.y0 + 16); }
+      if (i) { ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.moveTo(xa + .5, g.y0 - 16); ctx.lineTo(xa + .5, g.y1); ctx.stroke(); ctx.setLineDash([]); }
+      if (xb - xa > 34) { ctx.fillStyle = '#6a6a88'; ctx.fillText(bpmTxt(s.bpm * k) + (s.trend === 'up' ? '↗' : s.trend === 'down' ? '↘' : ''), xa + 5, 4); }
+    });
+
+    // grid + labels
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+    const step = niceStep((hi - lo) / 4);
+    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+      const y = Math.round(ty(v)) + .5; ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.beginPath(); ctx.moveTo(g.x0, y); ctx.lineTo(g.x1, y); ctx.stroke();
+      ctx.fillStyle = '#44445a'; ctx.fillText(String(Math.round(v * 10) / 10), g.x0 - 6, y);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    const tStep = niceTime(an.duration / Math.max(2, Math.floor((g.x1 - g.x0) / 90)));
+    for (let t = 0; t <= an.duration; t += tStep) { ctx.fillStyle = '#44445a'; ctx.fillText(fmtT(t), tx(g, t), g.y1 + 14); }
+    ctx.textAlign = 'left';
+
+    // selection
+    const sa = tx(g, S.sel.a), sb = tx(g, S.sel.b);
+    ctx.fillStyle = 'rgba(0,0,0,0.42)'; ctx.fillRect(g.x0, 0, sa - g.x0, g.h); ctx.fillRect(sb, 0, g.x1 - sb, g.h);
+    ctx.fillStyle = 'rgba(255,140,45,0.07)'; ctx.fillRect(sa, g.y0 - 16, sb - sa, g.y1 - g.y0 + 16);
+    ctx.strokeStyle = '#ff8c2d'; ctx.lineWidth = 1.5;
+    [sa, sb].forEach(x => { ctx.beginPath(); ctx.moveTo(x, g.y0 - 16); ctx.lineTo(x, g.y1); ctx.stroke(); ctx.fillStyle = '#ff8c2d'; ctx.fillRect(x - 3, g.y1 - 10, 6, 10); });
+    ctx.lineWidth = 1;
+
+    // what the export will sound like (dashed, inside the part)
+    if (change && tgt >= 20 && tgt <= 400) {
+      ctx.save(); ctx.beginPath(); ctx.rect(sa, g.y0 - 16, sb - sa, g.y1 - g.y0 + 16); ctx.clip();
+      ctx.strokeStyle = 'rgba(255,140,45,0.9)'; ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5; ctx.beginPath();
+      if (S.mode === 'lock') { ctx.moveTo(sa, ty(tgt)); ctx.lineTo(sb, ty(tgt)); }
+      else { const r = tgt / partStats(S.sel.a, S.sel.b).avg;
+        an.times.forEach((t, i) => { const x = tx(g, t), y = ty(an.bpm[i] * k * r); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); }
+      ctx.stroke(); ctx.restore(); ctx.setLineDash([]); ctx.lineWidth = 1;
+    }
+
+    // the tempo curve
+    ctx.strokeStyle = '#ff2d6b'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
+    an.times.forEach((t, i) => { const x = tx(g, t), y = ty(an.bpm[i] * k); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke(); ctx.lineWidth = 1;
+
+    // playhead
+    if (S.playing === 'part') { const x = tx(g, au.currentTime); ctx.strokeStyle = '#ffffff'; ctx.beginPath(); ctx.moveTo(x + .5, g.y0 - 16); ctx.lineTo(x + .5, g.y1); ctx.stroke(); }
+    // hover
+    if (S.hover !== null && !S.drag) { const x = tx(g, S.hover); ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.beginPath(); ctx.moveTo(x + .5, g.y0 - 16); ctx.lineTo(x + .5, g.y1); ctx.stroke();
+      ctx.fillStyle = '#ff2d6b'; ctx.beginPath(); ctx.arc(x, ty(bpmAt(S.hover)), 3.5, 0, Math.PI * 2); ctx.fill(); }
+  }
+  function niceStep(x) { const p = Math.pow(10, Math.floor(Math.log10(x))), f = x / p; return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p; }
+  function niceTime(x) { for (const s of [5, 10, 15, 20, 30, 60, 90, 120, 180, 300, 600]) if (s >= x) return s; return 900; }
+
+  // mouse: drag = pick a part (drag an orange edge to adjust), click = play from there, double-click = that section
+  const gr = $('graph');
+  function evT(e) { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, t: xt(geo(), e.clientX - r.left) }; }
+  gr.addEventListener('mousedown', e => {
+    if (!S.an || e.button !== 0) return;
+    const { x, t } = evT(e), g = geo(), sa = tx(g, S.sel.a), sb = tx(g, S.sel.b);
+    let edge = Math.abs(x - sa) < 7 ? 'a' : Math.abs(x - sb) < 7 ? 'b' : null;
+    S.drag = { x0: x, t0: t, edge, moved: false };
+  });
+  window.addEventListener('mousemove', e => {
+    if (!S.an) return;
+    const { x, t } = evT(e), r = cv.getBoundingClientRect();
+    const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    if (S.drag) {
+      if (Math.abs(x - S.drag.x0) > 3) S.drag.moved = true;
+      if (S.drag.moved) {
+        if (S.drag.edge === 'a') S.sel.a = Math.min(t, S.sel.b - 0.5);
+        else if (S.drag.edge === 'b') S.sel.b = Math.max(t, S.sel.a + 0.5);
+        else S.sel = { a: Math.min(S.drag.t0, t), b: Math.max(S.drag.t0, t) };
+        syncSelUI(); renderPlan(); draw();
+      }
+    }
+    S.hover = inside ? t : null;
+    const tip = $('tip');
+    if (inside) { tip.classList.remove('hidden'); tip.textContent = fmtT(t, true) + '  ·  ' + bpmTxt(bpmAt(t)) + ' BPM';
+      tip.style.left = Math.min(r.width - tip.offsetWidth - 6, Math.max(6, x + 10)) + 'px'; }
+    else tip.classList.add('hidden');
+    gr.style.cursor = inside && !S.drag ? ((Math.abs(x - tx(geo(), S.sel.a)) < 7 || Math.abs(x - tx(geo(), S.sel.b)) < 7) ? 'ew-resize' : 'crosshair') : '';
+    if (!S.drag) draw();
+  });
+  window.addEventListener('mouseup', e => {
+    if (!S.drag) return;
+    const d = S.drag; S.drag = null;
+    if (d.moved) setSel(S.sel.a, S.sel.b, true);
+    else { const { t } = evT(e);                      // click: listen from here
+      const src = '/api/tempo/media/' + S.sid + '/source'; if (!au.src.endsWith(src)) au.src = src;
+      if (t < S.sel.a || t > S.sel.b) setSel(0, S.an.duration, false);
+      au.currentTime = t; au.play().catch(() => {}); S.playing = 'part'; $('play').innerHTML = '&#9632; Stop'; loop(); }
+  });
+  gr.addEventListener('dblclick', e => {
+    if (!S.an) return; const { t } = evT(e);
+    const s = S.an.sections.find(s => t >= s.t0 && t <= s.t1);
+    if (s) setSel(s.t0, s.t1, false);
+  });
+  gr.addEventListener('mouseleave', () => { S.hover = null; $('tip').classList.add('hidden'); draw(); });
+  window.addEventListener('resize', draw);
+
+  // ── restore last options ───────────────────────────────────────────────
+  $('target').value = store.get('target', '100'); $('change').checked = store.get('change', true);
+  segPick('mode', 'm', 'mode', store.get('mode', 'lock')); segPick('pitch', 'p', 'pitch', store.get('pitch', 'keep')); segPick('fmt', 'f', 'fmt', store.get('fmt', 'mp3'));
+  onTarget(); render();
+  window.tempoLab = S;          // for debugging (right-click → Inspect with --debug)
+})();
+</script>
+</body>
+</html>
