@@ -1,5 +1,32 @@
 # Changelog
 
+## 3.8.0
+
+**New**
+- **Try another match** (Timing tab, or **M**): one button instead of nudging. Each press puts the song on
+  the video's beat a different way — best guesses first — and plays it. **Back** (Shift+M) returns to the
+  one before, **Reset** to the automatic match. The engine already ranked these placements; the button to
+  use them was missing.
+- **Fine-tune by hand** is now folded away under that button (Step, Grid lock, ± beat, ± ms, Song start).
+  Open it once and it stays open.
+- **Songs and videos without a steady tempo** (live drums, older records, DJ sets): the beat is followed
+  through the file. A wandering song is steadied; for a wandering video the song is bent to follow it.
+  Before, one tempo was used for the whole file, so it was in sync at the start and off by the end.
+  Only in Match Video mode, and only when it measurably puts more hits on the beat.
+
+**Fixed**
+- **Tempo up to 1.7% wrong on sparse beats** (half-time, trap, beats with few kicks) — out of sync within
+  seconds. The fine tempo search gave up when the rhythm did not repeat clearly after one beat, and kept a
+  rough value that was also pulled toward 115 BPM. It now fits 1, 2, 4 and 8 beats together and skips weak
+  lags instead of stopping.
+- **Song one beat off** (its kick on the video's snare). Placements are now also scored kick-on-kick and
+  snare-on-snare, and marked down for kick-on-snare.
+- **Song a sixteenth or half a beat off when a tempo was read in half time** (e.g. 128 BPM read as 64): a
+  steady kick then counted as "unsure" and a syncopated snare moved the grid; and the song's own beats
+  were treated as off-beats.
+- **Song ~15 ms late without Rubber Band**: the built-in stretch smears kicks, and the kick position was
+  read from the smeared audio. It is now taken from the clean audio in that case.
+
 ## 3.7.0
 
 **Changed**

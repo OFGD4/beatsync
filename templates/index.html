@@ -222,6 +222,16 @@
   .ro-main { font-family: 'Bebas Neue', sans-serif; font-size: 22px; letter-spacing: 1.5px; color: var(--accent2); line-height: 1; white-space: nowrap; }
   .ro-sub { font-size: 10px; color: var(--muted); }
   .nudge-grid { display: grid; grid-template-columns: 1.25fr 1fr 1fr 1.25fr; gap: 6px; }
+  .try-btn { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border: none; font-family: 'Bebas Neue', sans-serif; font-size: 17px; letter-spacing: 1.4px; padding: 7px 14px; border-radius: 6px; cursor: pointer; white-space: nowrap; transition: transform .12s, opacity .15s; flex-shrink: 0; }
+  .try-btn:hover:not(:disabled) { transform: translateY(-1px); }
+  .try-btn:active:not(:disabled) { transform: scale(.97); }
+  .try-btn:disabled { opacity: .35; cursor: default; }
+  .try-note { font-size: 10.5px; color: var(--muted); min-width: 0; }
+  .try-note b { color: var(--accent2); font-weight: 500; }
+  .more-toggle { flex-shrink: 0; white-space: nowrap; background: none; border: none; color: var(--muted); font: inherit; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; padding: 2px 0; }
+  .more-toggle:hover { color: var(--accent); }
+  .manual { display: flex; flex-direction: column; gap: 8px; }
+  .manual.hidden { display: none; }
   .nbtn { background: var(--bg); border: 1px solid var(--border2); color: var(--text); font-size: 11px; padding: 9px 4px; border-radius: 6px; cursor: pointer; transition: all .12s; white-space: nowrap; }
   .nbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   .nbtn:active:not(:disabled) { transform: scale(.97); }
@@ -465,6 +475,7 @@
             <button class="tab" data-pane="export">Export</button>
             <span class="keys">Keys
               <span class="keys-pop">
+                <span class="kbd">M</span> try another match &nbsp; <span class="kbd">Shift</span>+<span class="kbd">M</span> back<br>
                 <span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> nudge one step<br>
                 <span class="kbd">Shift</span>+<span class="kbd">&larr;</span><span class="kbd">&rarr;</span> &plusmn;10 ms (Grid lock off)<br>
                 <span class="kbd">1</span>–<span class="kbd">5</span> step size &nbsp; <span class="kbd">L</span> grid lock &nbsp; <span class="kbd">R</span> reset<br>
@@ -479,18 +490,28 @@
             <!-- Timing -->
             <div class="pane on" id="pane-timing">
               <div class="prow">
-                <span class="caps">Step</span>
-                <div class="seg" id="unit-seg"><button data-unit="bar">Bar</button><button data-unit="beat" class="on">Beat</button><button data-unit="half"><span class="fr">&frac12;</span></button><button data-unit="quarter"><span class="fr">&frac14;</span></button><button data-unit="eighth"><span class="fr">&#8539;</span></button></div>
-                <button class="toggle on" id="lock" aria-pressed="true" title="Keep every nudge on the beat grid. Turn off for millisecond fine-tuning."><span class="sw"></span><span>Grid lock</span></button>
+                <button class="try-btn" id="try-match" title="Puts the song on the video's beat a different way and plays it.&#10;Keep pressing until it sounds right. (M)">&#8635; Try another match</button>
+                <button class="btn-ghost" id="try-prev" title="The one before (Shift+M)" disabled>&lsaquo; Back</button>
                 <span class="spacer"></span>
                 <span class="ro-main" id="ro-main" title="How far the song is moved from the automatic match">AUTO</span>
                 <button class="btn-ghost" id="reset-timing" title="Back to the automatic match (R)" disabled>Reset</button>
               </div>
+              <div class="prow">
+                <span class="try-note ell" id="try-note">Beat sounds off? Press it until it fits.</span>
+                <span class="spacer"></span>
+                <button class="more-toggle" id="manual-toggle" aria-expanded="false" title="Move the song yourself: by bars, beats or milliseconds">&#9656; Fine-tune by hand</button>
+              </div>
+              <div class="manual hidden" id="manual">
+              <div class="prow">
+                <span class="caps">Step</span>
+                <div class="seg" id="unit-seg"><button data-unit="bar">Bar</button><button data-unit="beat" class="on">Beat</button><button data-unit="half"><span class="fr">&frac12;</span></button><button data-unit="quarter"><span class="fr">&frac14;</span></button><button data-unit="eighth"><span class="fr">&#8539;</span></button></div>
+                <button class="toggle on" id="lock" aria-pressed="true" title="Keep every nudge on the beat grid. Turn off for millisecond fine-tuning."><span class="sw"></span><span>Grid lock</span></button>
+              </div>
               <div class="nudge-grid">
-                <button class="nbtn big" id="n-back" title="← key">&laquo; &minus;<span class="unit-name">1 beat</span></button>
+                <button class="nbtn big" id="n-back" title="The song's beat comes later (← key)">&laquo; &minus;<span class="unit-name">1 beat</span></button>
                 <button class="nbtn" id="n-fine-back">&lsaquo; &minus;10 ms</button>
                 <button class="nbtn" id="n-fine-fwd">+10 ms &rsaquo;</button>
-                <button class="nbtn big" id="n-fwd" title="→ key">+<span class="unit-name">1 beat</span> &raquo;</button>
+                <button class="nbtn big" id="n-fwd" title="The song's beat comes earlier (→ key)">+<span class="unit-name">1 beat</span> &raquo;</button>
               </div>
               <div class="ro-sub ell" id="ro-sub">&mdash;</div>
               <div class="prow" title="Where the song starts. Jump moves in whole bars so downbeats stay aligned.">
@@ -498,6 +519,7 @@
                 <input type="range" id="seek" min="0" max="300" step="0.1" value="0" aria-label="Song start position">
                 <span class="val" id="seek-val" style="min-width:48px">0:00.0</span>
                 <button class="btn-ghost" id="seek-go">Jump</button>
+              </div>
               </div>
             </div>
 
@@ -1094,7 +1116,7 @@
     $('run-btn').disabled = false; $('run-btn').textContent = ok ? 'Match Again' : 'Match Beats';
     $('prog-spin').classList.add('hidden');
     if (!ok) { $('progress').classList.add('hidden'); $('empty').classList.remove('hidden'); S.phase = 'idle'; }
-    else setProgress('Matched — fine-tune on the right', 100);
+    else setProgress('Matched — beat off? Press “Try another match”', 100);
   }
 
   // ── Event stream (only the latest job is listened to) ───────────────────
@@ -1266,7 +1288,14 @@
   function renderTiming() {
     const t = S.timing; if (!t) return;
     const auto = Math.abs(t.delta_ms) < 0.5;
-    $('ro-main').innerHTML = auto ? 'AUTO' : frHtml(fracBeats(t.delta_beats) + (Math.abs(t.delta_beats) <= 1.001 ? ' BEAT' : ' BEATS'));
+    const n = t.match_count || 1, picked = t.match !== null && t.match !== undefined;
+    $('ro-main').innerHTML = auto ? 'AUTO' : picked && t.match > 0 ? 'MATCH ' + (t.match + 1) + '/' + n
+      : frHtml(fracBeats(t.delta_beats) + (Math.abs(t.delta_beats) <= 1.001 ? ' BEAT' : ' BEATS'));
+    $('try-match').disabled = n < 2; $('try-prev').disabled = n < 2 || (picked && t.match === 0);
+    $('try-note').innerHTML = n < 2 ? 'Only one way to place this song.'
+      : !picked ? 'Moved by hand &mdash; press to go back to the matches.'
+      : t.match === 0 ? 'Beat sounds off? Press it until it fits.'
+      : '<b>Match ' + (t.match + 1) + ' of ' + n + '</b> &mdash; still off? Press again.';
     const parts = ['offset ' + t.offset.toFixed(3) + 's'];
     if (!auto) parts.push((t.delta_ms > 0 ? '+' : '') + Math.round(t.delta_ms) + ' ms from auto');
     parts.push(t.target_bpm.toFixed(2) + ' BPM', t.beats_per_bar + ' beats/bar');
@@ -1291,9 +1320,10 @@
   function scheduleAdjust(delta, optsChanged) {
     if (S.phase !== 'studio' || !S.currentJob) return;
     const p = S.pending || (S.pending = { beats: 0, ms: 0, opts: false });
+    if (delta.match) { p.match = (p.match || 0) + delta.match; p.beats = 0; p.ms = 0; delete p.reset; delete p.seek_to; }
     if (delta.beats) p.beats += delta.beats;
     if (delta.ms) p.ms += delta.ms;
-    if (delta.reset) { p.reset = true; p.beats = 0; p.ms = 0; delete p.seek_to; }
+    if (delta.reset) { p.reset = true; p.beats = 0; p.ms = 0; delete p.seek_to; delete p.match; }
     if (delta.seek_to !== undefined) { p.seek_to = delta.seek_to; p.beats = 0; p.ms = 0; delete p.reset; }
     if (delta.preserve_pitch !== undefined) p.preserve_pitch = delta.preserve_pitch;
     if (optsChanged) p.opts = true;
@@ -1308,6 +1338,7 @@
     if (p.beats) body.beats = p.beats;
     if (p.ms) body.ms = p.ms;
     if (p.reset) body.reset = true;
+    if (p.match) body.match_steps = p.match;
     if (p.seek_to !== undefined) body.seek_to = p.seek_to;
     if (p.preserve_pitch !== undefined) body.preserve_pitch = p.preserve_pitch;
     if (p.opts) body.opts = JSON.parse(JSON.stringify(S.opts));
@@ -1327,6 +1358,16 @@
   }
   $('unit-seg').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setUnit(b.dataset.unit); });
   $('lock').addEventListener('click', () => { S.lock = !S.lock; setToggle($('lock'), S.lock); updateUnitLabels(); if (S.lock) toast('Grid lock on — nudges snap to ' + UNIT_NAME[S.unit] + 's'); });
+  $('try-match').addEventListener('click', () => scheduleAdjust({ match: 1 }));
+  $('try-prev').addEventListener('click', () => scheduleAdjust({ match: -1 }));
+  function setManual(open) {
+    $('manual').classList.toggle('hidden', !open);
+    $('manual-toggle').innerHTML = (open ? '&#9662;' : '&#9656;') + ' Fine-tune by hand';
+    $('manual-toggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+    try { localStorage.setItem('bs-manual', open ? '1' : '0'); } catch (e) {}
+  }
+  $('manual-toggle').addEventListener('click', () => setManual($('manual').classList.contains('hidden')));
+  try { if (localStorage.getItem('bs-manual') === '1') setManual(true); } catch (e) {}
   $('n-back').addEventListener('click', () => scheduleAdjust({ beats: -unitBeats() }));
   $('n-fwd').addEventListener('click', () => scheduleAdjust({ beats: unitBeats() }));
   $('n-fine-back').addEventListener('click', () => scheduleAdjust({ ms: -10 }));
@@ -1578,6 +1619,7 @@
       else scheduleAdjust({ beats: unitBeats() * dir });
     } else if (e.key === ' ') { e.preventDefault(); if (!e.repeat) togglePlay(); }
     else if (e.key === 'r' || e.key === 'R') scheduleAdjust({ reset: true });
+    else if (e.key === 'm' || e.key === 'M') { if (!$('try-match').disabled) scheduleAdjust({ match: e.shiftKey ? -1 : 1 }); }
     else if (e.key === 'l' || e.key === 'L') $('lock').click();
     else if (e.key === 'f' || e.key === 'F') toggleFs();
     else if (/^[1-5]$/.test(e.key)) setUnit(UNITS[+e.key - 1]);

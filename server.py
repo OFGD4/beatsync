@@ -856,28 +856,6 @@ N_FFT = 2048
 CHUNK_SEC = 60.0             # long files are analysed in chunks of this size (flat memory)
 
 
-def _refine_bpm(beat_times):
-    """Tempo from a line through beat number vs beat time. The beat number counts beats the
-    tracker skipped (noise, breaks); the old mean of the gaps counted a skipped beat as one long
-    gap, which pulled the tempo down (1.4% on a noisy test video = seconds of drift)."""
-    import numpy as np
-    bt = np.atleast_1d(np.asarray(beat_times, dtype=float))
-    if len(bt) < 4:
-        return None
-    d = np.diff(bt)
-    med = float(np.median(d))
-    if med <= 0:
-        return None
-    k = np.concatenate([[0], np.cumsum(np.maximum(1, np.round(d / med)))])
-    slope, icpt = np.polyfit(k, bt, 1)
-    good = np.abs(bt - (slope * k + icpt)) < 0.25 * med
-    if good.sum() >= 4:
-        slope, icpt = np.polyfit(k[good], bt[good], 1)
-    if not 0.5 * med < slope < 1.5 * med:
-        return None
-    return round(60.0 / float(slope), 4)
-
-
 def _median_along(S, size, axis):
     """scipy.ndimage.median_filter(S, size along `axis` only, mode='reflect'), run as one 1-D
     filter per row. Same numbers, but SciPy's 1-D median (SciPy >= 1.15) is ~10x faster than
@@ -919,6 +897,8 @@ def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
       oenv      — onset strength, same as librosa.onset.onset_strength(y, hop)
       oenv_perc — onset strength of the percussive part (HPSS, margin 3)
       low_env   — onset envelope of the ≤250 Hz band (kicks / downbeats)
+      mid_env   — onset envelope of the percussive 1–5 kHz band (snares / claps: the backbeat)
+      kick_env  — onset envelope of the percussive ≤250 Hz band, linear (kick drums)
     """
     import numpy as np
     import librosa
@@ -928,9 +908,11 @@ def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
     chunk = max(step, int(chunk_sec * sr) // step * step)
     pad = (N_FFT // step + 40) * step                # STFT window + HPSS median-filter context
     n_frames = 1 + n // hop
-    low = librosa.fft_frequencies(sr=sr, n_fft=N_FFT) <= 250
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=N_FFT)
+    low = freqs <= 250
+    mid = (freqs >= 1000) & (freqs <= 5000)
     mel_basis = librosa.filters.mel(sr=sr, n_fft=N_FFT)
-    mel, mel_perc, low_mag = [], [], []
+    mel, mel_perc, low_mag, mid_mag, kick_mag = [], [], [], [], []
     for a in range(0, max(n, 1), chunk):
         b = min(n, a + chunk)
         s0, s1 = max(0, a - pad), min(n, b + pad)
@@ -943,6 +925,8 @@ def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
         y_perc = _hpss_percussive(seg, margin=3.0)
         P = np.abs(librosa.stft(y_perc, n_fft=N_FFT, hop_length=hop))[:, f0:f1]
         mel_perc.append(mel_basis @ (P ** 2))
+        mid_mag.append(np.sqrt(np.mean(P[mid] ** 2, axis=0)))
+        kick_mag.append(np.sqrt(np.mean(P[low] ** 2, axis=0)))
         del D, P, y_perc
     S = librosa.power_to_db(np.concatenate(mel, axis=1))
     oenv = librosa.onset.onset_strength(S=S, sr=sr, hop_length=hop)
@@ -950,7 +934,13 @@ def _analysis_features(y, sr, hop=HOP, chunk_sec=CHUNK_SEC):
     oenv_perc = librosa.onset.onset_strength(S=S, sr=sr, hop_length=hop)
     L = librosa.amplitude_to_db(np.concatenate(low_mag, axis=1), ref=np.max)
     low_env = np.concatenate([[0], np.maximum(0, np.diff(L, axis=1)).mean(axis=0)])
-    return {'oenv': oenv, 'oenv_perc': oenv_perc, 'low_env': low_env, 'sr': sr, 'hop': hop}
+    # Linear, not dB: a snare has to count for more than a quiet hi-hat in the same band.
+    mid_env = np.concatenate([[0], np.maximum(0, np.diff(np.concatenate(mid_mag)))])
+    # The same for the kick: low_env is in dB, where a bass line or room noise moves as much as a
+    # kick does — good for "is there low end on this beat", too blunt to tell a kick from a snare.
+    kick_env = np.concatenate([[0], np.maximum(0, np.diff(np.concatenate(kick_mag)))])
+    return {'oenv': oenv, 'oenv_perc': oenv_perc, 'low_env': low_env, 'mid_env': mid_env, 'kick_env': kick_env,
+            'sr': sr, 'hop': hop}
 
 
 def _retime(env, rate):
@@ -1006,10 +996,120 @@ def _tracker_tempo(oenv, sr, hop, start_bpm=120.0, std_bpm=1.0, max_tempo=320.0)
     return float(bpms[int(np.argmax(np.log1p(1e6 * tg) + logprior))])
 
 
+def _acf(env):
+    """Autocorrelation of an envelope (unbiased, 1.0 at lag 0)."""
+    import numpy as np
+    x = np.asarray(env, dtype=np.float64)
+    n = len(x)
+    if n < 4:
+        return np.ones(max(n, 1))
+    x = x - x.mean()
+    nf = 1 << int(np.ceil(np.log2(2 * n)))
+    F = np.fft.rfft(x, nf)
+    r = np.fft.irfft(F * np.conj(F), nf)[:n] / np.arange(n, 0, -1)
+    return r / (r[0] + 1e-12)
+
+
+TEMPO_SCAN = (50.0, 210.0, 0.25)          # BPM range searched, and its step
+_METER_W = ((1, 1.0), (2, 0.8), (4, 1.0), (8, 0.7))
+
+
+def _meter_strength(A, period):
+    """How well a beat of `period` frames explains the rhythm: the music has to repeat after
+    1, 2, 4 and 8 of those beats. That is what tells the real beat from a 'dotted' one — a
+    tempo 1.5x or 0.75x off still finds hits every beat, but its bars do not repeat."""
+    half = len(A) // 2
+    tot = wsum = 0.0
+    for m, w in _METER_W:
+        L = period * m
+        tol = max(1.0, 0.015 * L)
+        a, b = int(L - tol), int(math.ceil(L + tol)) + 1
+        if a < 1 or b >= half:
+            continue
+        tot += w * max(0.0, float(A[a:b].max()))
+        wsum += w
+    return tot / wsum if wsum else 0.0
+
+
+def _refine_period_acf(A, period):
+    """Sharpen a beat period (frames), in two steps.
+    1. The tempo scan only knows the period to ±1.5% (_meter_strength takes the best value in
+       a window, so its score is flat over that range and the tempo prior then pulls the pick to
+       the window's edge). So first the period that fits 1, 2, 4 and 8 beats at once is searched
+       around it, without any window.
+    2. Then ever longer lags: 2, 4, 8, … beats. Every doubling halves the error, so a few
+       minutes of music pin the tempo to a few hundredths of a percent. A lag at which the
+       rhythm does not repeat clearly is skipped, not the end of the search — half-time, trap
+       and other sparse beats have almost nothing at one beat, and used to be left unrefined
+       (up to 1.7% off: out of sync within seconds)."""
+    import numpy as np
+    half = len(A) // 2
+    xs = np.arange(len(A), dtype=float)
+    cand = period * np.linspace(0.972, 1.028, 281)
+    tot = np.zeros(len(cand))
+    for m, w in _METER_W:
+        L = cand * m
+        if L[-1] >= half - 1:
+            continue
+        tot += w * np.maximum(0.0, np.interp(L, xs, A))
+    if tot.max() > 0:
+        # centre of the best region, not its first sample
+        k = int(np.argmax(tot))
+        near = np.flatnonzero(tot >= 0.98 * tot[k])
+        near = near[np.abs(near - k) <= 12]
+        period = float(np.sum(cand[near] * tot[near]) / np.sum(tot[near]))
+    m, unc = 1, 0.006 * period                      # unc: how far off the period may still be (frames)
+    far = int(len(A) * 0.7)                         # short clips: every lag that still has data counts
+    # Only clear repeats may move the period: a faint bump at one beat is noise, and one frame
+    # there is already 3% of the tempo.
+    top = 0.0
+    for mm, _ in _METER_W:
+        c = int(round(period * mm))
+        if 3 <= c < far - 3:
+            top = max(top, float(A[c - 2:c + 3].max()))
+    floor = max(0.05, 0.35 * top)
+    while True:
+        L = period * m
+        tol = max(1.5, unc * m)
+        a, b = int(round(L - tol)), int(round(L + tol)) + 1
+        if a < 2 or b >= far - 1 or tol > 0.2 * period:
+            break
+        k = a + int(np.argmax(A[a:b]))
+        if A[k] > floor and a < k < b - 1 and A[k] >= A[k - 1] and A[k] >= A[k + 1]:
+            den = A[k - 1] - 2 * A[k] + A[k + 1]
+            d = 0.5 * (A[k - 1] - A[k + 1]) / den if den < 0 else 0.0
+            period = (k + max(-0.5, min(0.5, float(d)))) / m
+            unc = 0.75 / m
+        m *= 2
+    return period
+
+
+def _onset_events(oenv, sr, hop, start_frame=0, latency=None):
+    """Onset times (s) + strengths from an onset envelope, peaks interpolated between frames."""
+    import numpy as np
+    from scipy.signal import find_peaks
+    e = np.asarray(oenv, dtype=np.float64)[start_frame:]
+    if len(e) < 8 or e.max() <= 0:
+        return np.array([]), np.array([])
+    pk, _ = find_peaks(e, height=0.12 * e.max(), distance=max(1, int(0.05 * sr / hop)))
+    pk = pk[(pk > 0) & (pk < len(e) - 1)]
+    if len(pk) == 0:
+        return np.array([]), np.array([])
+    den = e[pk - 1] - 2 * e[pk] + e[pk + 1]
+    d = np.where(den < 0, 0.5 * (e[pk - 1] - e[pk + 1]) / np.where(den < 0, den, -1.0), 0.0)
+    lat = ONSET_LATENCY if latency is None else latency
+    return (pk + np.clip(d, -0.5, 0.5) + start_frame) * hop / sr + lat, e[pk]
+
+
+MID_LATENCY = 0.012          # same for the snare-band envelope
+ONSET_LATENCY = -0.016       # onset-envelope peaks trail the attack; this puts them on _kick_attacks' clock
+
+
 def _detect_bpm(y, sr, feat=None):
-    """Returns (bpm, beat_times, confidence, music_start_samples, raw_beat_times).
-    beat_times are back-tracked to the onset; raw_beat_times are the tracker's
-    pulse positions (better for fitting a grid)."""
+    """Returns (bpm, beat_times, confidence, music_start_samples, beat_times, extra).
+    The tempo is the beat whose bars repeat best (see _meter_strength), then sharpened on long
+    lags. Both beat lists are the constant grid fitted to the track.
+    `extra` holds the kick / snare / onset events, reused by the alignment."""
     import numpy as np
     import librosa
 
@@ -1018,56 +1118,49 @@ def _detect_bpm(y, sr, feat=None):
         feat = _analysis_features(y, sr, hop)
     f0 = _music_start_frame(feat['oenv'], sr, hop)
     music_start = f0 * hop
-    oenv_full = feat['oenv'][f0:]
-    oenv_perc = feat['oenv_perc'][f0:]
+    fps = sr / hop
 
-    tempo_a = _tracker_tempo(oenv_perc, sr, hop)
+    A = (_acf(feat['oenv'][f0:]) + _acf(feat['low_env'][f0:]) + _acf(feat['oenv_perc'][f0:])) / 3.0
+    lo, hi, step = TEMPO_SCAN
+    bpms = np.arange(lo, hi + 1e-9, step)
+    prior = 0.4 + 0.6 * np.exp(-0.5 * ((np.log2(bpms) - np.log2(115.0)) / 0.9) ** 2)
+    strength = np.array([_meter_strength(A, 60.0 / b * fps) for b in bpms])
+    score = strength * prior
+    k = int(np.argmax(score))
+    best_bpm, best_score = float(bpms[k]), float(score[k])
 
-    mean_tg = _mean_tempogram(oenv_full, sr, hop)
-    bpm_axis = librosa.tempo_frequencies(len(mean_tg), sr=sr, hop_length=hop)
-
-    # The beat tracker's tempo is the anchor; the tempogram picks the octave.
-    # (Earlier versions also "voted" with a tempogram peak and a PLP estimate,
-    # but both were broken — lag 0 / rising edges — so they never took part.
-    # Making them work caused octave errors, so they are gone.)
-    anchor = tempo_a
-
-    candidates = {round(anchor * m, 2) for m in (0.5, 1.0, 2.0) if 40 <= round(anchor * m, 2) <= 240}
-    best_bpm, best_score = anchor, -1.0
-    for cand in candidates:
-        idx = int(np.argmin(np.abs(bpm_axis - cand)))
-        score = float(mean_tg[idx])
-        ratio = cand / anchor if anchor != 0 else 1.0
-        if ratio > 1.5:
-            score *= 0.85
-        elif ratio < 0.67:
-            score *= 0.80
-        if score > best_score:
-            best_score, best_bpm = score, cand
-
-    _, beat_frames = librosa.beat.beat_track(onset_envelope=oenv_perc, sr=sr, hop_length=hop, bpm=best_bpm)
-    raw_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop) + (music_start / sr)
-    beat_frames = librosa.onset.onset_backtrack(beat_frames, oenv_full)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop) + (music_start / sr)
-
-    refined = _refine_bpm(beat_times)
-    if refined is not None:
-        best_bpm = refined
-    # Beat-tracker times are quantised to 11.6 ms frames and wobble when
-    # back-tracked, which leaves ~0.5% tempo error: seconds of drift on a long
-    # video. Fit the period to the kick attacks of the whole track instead.
+    # The beat tracker's tempo (librosa) is kept when it explains the bars about as well:
+    # it is the better judge between two close calls, the bar test between distant ones.
     try:
-        precise = _precise_period(y, sr, 60.0 / best_bpm)
-        if precise:
-            best_bpm = 60.0 / precise
+        tempo_a = _tracker_tempo(feat['oenv_perc'][f0:], sr, hop)
+        for mlt in (1.0, 0.5, 2.0):
+            c = tempo_a * mlt
+            if lo <= c <= hi:
+                i = int(round((c - lo) / step))
+                if score[i] >= 0.92 * best_score and abs(math.log2(c / best_bpm)) > 0.1:
+                    best_bpm = float(bpms[i])
+                    break
     except Exception:
         pass
 
-    idx_best = int(np.argmin(np.abs(bpm_axis - best_bpm)))
-    peak_energy = float(mean_tg[idx_best])
-    total_energy = float(np.sum(mean_tg) + 1e-9)
-    confidence = min(1.0, peak_energy / (total_energy / len(bpm_axis)) / 10.0)
-    return round(best_bpm, 4), beat_times, round(confidence, 3), music_start, raw_times
+    # Sharpened on the long lags: a few thousandths of a percent, so even a long video does
+    # not drift. (An extra fit on the kick times used to follow; on sparse or busy drums it
+    # locked onto a side peak and made the tempo worse, up to 0.5%.)
+    period = _refine_period_acf(A, 60.0 / best_bpm * fps) / fps            # seconds
+    best_bpm = 60.0 / period
+    kick = _kick_attacks(y, sr)
+    snare = _onset_events(feat['mid_env'], sr, hop, f0, MID_LATENCY)
+    onset = _onset_events(feat['oenv'], sr, hop, f0)
+
+    phase = _beat_phase(kick, snare, onset, period)['phase']
+    n_sec = len(y) / sr
+    first = phase + math.ceil((music_start / sr - phase) / period - 1e-9) * period
+    beat_times = np.arange(first, n_sec, period) if n_sec > first else np.array([])
+
+    conf = min(1.0, float(_meter_strength(A, period * fps)) / 0.6)
+    extra = {'kick': kick, 'snare': snare, 'onset': onset, 'period': period}
+    return round(best_bpm, 4), beat_times, round(conf, 3), music_start, beat_times, extra
+
 
 
 _METER_BIAS = {2: 0.95, 3: 1.00, 4: 1.05, 5: 0.85, 6: 1.00, 7: 0.80}
@@ -1101,110 +1194,6 @@ def _detect_downbeats(low_env, sr, beat_times, hop=HOP):
     if float(np.mean(beat_energies[idx])) < (float(np.mean(beat_energies)) + 1e-9) * 1.05:
         return beat_times, 1
     return beat_times[idx], bpb
-
-
-def _lcm(a, b):
-    from math import gcd
-    return a * b // gcd(a, b)
-
-
-def _find_beat_offset(vid_feat, song_feat, vid_beats, song_beats, sr, vid_rate=1.0, song_rate=1.0):
-    """
-    Where in the song the video should start. Beat times / features are in each
-    source's original timeline; `*_rate` is the speed each one is played at in
-    the output (the song stretch, or the video speed-up in Match Song mode).
-    Returns (offset_samples @ sr, song_beat_times, song_downbeats, song_beats_per_bar),
-    all in output time.
-
-    Every candidate is scored at once with an FFT cross-correlation, so long
-    videos cost the same as short ones. A video longer than the song is matched
-    on the part that overlaps (it used to fall back to offset 0).
-    """
-    import numpy as np
-    from scipy.signal import correlate
-
-    hop = HOP
-    song_beats = np.atleast_1d(np.asarray(song_beats, dtype=float))
-    vid_beats = np.atleast_1d(np.asarray(vid_beats, dtype=float))
-    if len(song_beats) == 0 or len(vid_beats) == 0:
-        sb = song_beats / song_rate
-        return 0, sb, sb, 1
-
-    vid_downbeats, vid_bpb = _detect_downbeats(vid_feat['low_env'], sr, vid_beats, hop)
-    song_downbeats, song_bpb = _detect_downbeats(song_feat['low_env'], sr, song_beats, hop)
-    vid_beats, vid_downbeats = vid_beats / vid_rate, np.atleast_1d(vid_downbeats) / vid_rate
-    song_beats, song_downbeats = song_beats / song_rate, np.atleast_1d(song_downbeats) / song_rate
-    vid_first_downbeat = float(vid_downbeats[0]) if len(vid_downbeats) > 0 else float(vid_beats[0])
-
-    lcm_beats = _lcm(vid_bpb, song_bpb)
-    super_step = lcm_beats // song_bpb
-    if lcm_beats <= 28 and len(song_downbeats) >= 2 and super_step >= 1:
-        super_times = song_downbeats[::super_step]
-        search_times = super_times if len(super_times) >= 2 else (
-            song_downbeats if len(song_downbeats) >= 3 else song_beats)
-    elif len(song_downbeats) >= 3:
-        search_times = song_downbeats
-    else:
-        search_times = song_beats
-
-    vid_env = _retime(vid_feat['low_env'], vid_rate)
-    song_env = _retime(song_feat['low_env'], song_rate)
-    vid_env = vid_env / (np.max(vid_env) + 1e-9)
-    song_env = song_env / (np.max(song_env) + 1e-9)
-    nv, ns = len(vid_env), len(song_env)
-    corr = correlate(song_env, vid_env, mode='full', method='fft')     # corr[L+nv-1] = Σ song[i+L]·vid[i]
-
-    cands = []
-    min_overlap = 0.5 * min(nv, ns)
-    for sb_time in search_times:
-        offset_sec = float(sb_time) - vid_first_downbeat
-        if offset_sec < 0:
-            continue
-        lag = int(offset_sec * sr / hop)
-        ov = min(nv, ns - lag)
-        if ov <= 0 or ov < min_overlap:
-            continue
-        cands.append((lag + nv <= ns, offset_sec, lag, ov))
-    pool = [c for c in cands if c[0]]                   # offsets where the whole video fits
-    if not pool and cands:
-        # Video longer than what is left of the song: start the song at its first
-        # usable downbeat so as much of it as possible is used (used to give offset 0
-        # with no beat alignment at all).
-        pool = [min(cands, key=lambda c: c[1])]
-
-    best_score, best_offset_sec = -np.inf, 0.0
-    for _, offset_sec, lag, ov in pool:
-        seg = song_env[lag:lag + ov]
-        k = max(1, ov // 20)
-        score = float(corr[lag + nv - 1]) + 0.2 * float(np.sum(np.partition(seg, len(seg) - k)[-k:]))
-        if score > best_score:
-            best_score, best_offset_sec = score, offset_sec
-
-    # (Older versions snapped the offset itself to the nearest song beat. That put a
-    # song beat at video time 0 rather than on the video's beat — up to half a beat
-    # off. Every candidate is already song downbeat − video downbeat, so it is on-beat.)
-
-    # Fine-tune ±50 ms on the full-band onset envelopes
-    best_offset_samp = int(round(best_offset_sec * sr))
-    vo = _retime(vid_feat['oenv'], vid_rate)
-    so = _retime(song_feat['oenv'], song_rate)
-    base = int(round(best_offset_sec * sr / hop))
-    span = int(round(0.05 * sr / hop))
-    min_frames = sr / hop                                 # at least 1 s of overlap
-    best_d, best_fs = 0, -np.inf
-    for d in range(-span, span + 1):
-        lag = base + d
-        if lag < 0:
-            continue
-        ov = min(len(vo), len(so) - lag)
-        if ov < min_frames:
-            continue
-        s = float(np.dot(vo[:ov], so[lag:lag + ov])) / ov
-        if s > best_fs:
-            best_fs, best_d = s, d
-    best_offset_samp += best_d * hop
-
-    return max(0, best_offset_samp), song_beats, song_downbeats, int(song_bpb)
 
 
 def _kick_attacks(y, sr, fc=180.0, chunk_sec=CHUNK_SEC):
@@ -1241,101 +1230,553 @@ def _kick_attacks(y, sr, fc=180.0, chunk_sec=CHUNK_SEC):
     return (pk + lag / 2) * hop / sr + 0.0063, rise[pk]
 
 
-def _precise_period(y, sr, period, span=0.02, min_conc=0.4, min_prominence=8.0):
-    """
-    Refine a beat period to sub-millisecond precision: the period at which the
-    kick attacks line up best (circular concentration), searched within ±span.
-    Precision grows with the length of the track, which is what long videos need.
-    Returns None when there is no clear kick pulse (then the tracker's tempo stays).
-    The pulse strength counts the beat and the half-beat (off-beat bass / hats used to cancel
-    the kicks and hide a clear pulse), and a peak is accepted when it stands far above the
-    noise floor of the search range, not only above a fixed level.
-    """
+_FOLD_BINS = 128
+
+
+def _fold_hist(t, w, period):
+    """Where in the beat the events fall (time mod period, smoothed, sums to 1).
+    Each beat adds the square root of what it holds, so a place that is hit on every beat
+    outweighs one that is hit hard now and then — regular beats, not loud accents."""
     import numpy as np
-    t, w = _kick_attacks(y, sr)
-    if len(t) < 16 or w.sum() <= 0 or t[-1] - t[0] < 8 * period:
-        return None
-    t = t - t[0]
-    T = float(t[-1])
-    # peak width ≈ period² / T, so sample it at ~1/8 of that
-    step = max(period * period / T / 8, 1e-7)
-    grid = np.arange(period * (1 - span), period * (1 + span), step)
-    if len(grid) > 4000:
-        grid = np.linspace(period * (1 - span), period * (1 + span), 4000)
-    conc = np.empty(len(grid))
-    for i in range(0, len(grid), 256):            # bounded memory for very long tracks
-        g = grid[i:i + 256]
-        ph = np.exp(2j * np.pi * t[None, :] / g[:, None])
-        conc[i:i + len(g)] = (np.abs(ph @ w) + np.abs((ph * ph) @ w)) / (2 * w.sum())
-    k = int(np.argmax(conc))
-    clear = conc[k] >= min_conc or conc[k] >= min_prominence * float(np.median(conc))
-    if not clear or k == 0 or k == len(grid) - 1:
-        return None
-    p = float(grid[k])
-    # Off-beat hits (hats, bass) bias the concentration peak slightly, so finish
-    # with a weighted line fit through the attacks that sit on the pulse.
+    from scipy.ndimage import gaussian_filter1d
+    t0 = math.floor(float(np.min(t)) / period) * period
+    idx = np.floor((t - t0) / period * _FOLD_BINS).astype(np.int64)
+    n_beats = int(idx.max()) // _FOLD_BINS + 1
+    line = np.bincount(idx, weights=w, minlength=n_beats * _FOLD_BINS)
+    line = gaussian_filter1d(line, 0.02 * _FOLD_BINS, mode='constant')
+    h = np.sqrt(np.maximum(line, 0.0)).reshape(n_beats, _FOLD_BINS).sum(axis=0)
+    h = h - h.min()                                   # what is everywhere says nothing about where
+    return h / (float(h.sum()) + 1e-12)
+
+
+def _vote_conf(h):
+    """How clearly a fold histogram points at one place: its peak against the best place
+    at least a tenth of a beat away."""
+    import numpy as np
+    k = int(np.argmax(h))
+    d = np.abs(np.arange(_FOLD_BINS) - k)
+    d = np.minimum(d, _FOLD_BINS - d)
+    far = d > 0.1 * _FOLD_BINS
+    top = float(h[k])
+    if top <= 0:
+        return 0.0
+    conf = max(0.0, (top - float(h[far].max())) / top)
+    # A tempo read in half time puts a steady kick on two places, half a period apart. Either
+    # one is a beat, so that is a clear answer, not a doubtful one. (It used to count as "no
+    # idea", and a syncopated snare then moved the grid a sixteenth off.)
+    twin = np.abs(d - _FOLD_BINS // 2) <= 0.1 * _FOLD_BINS
+    if float(h[twin].max()) >= 0.6 * top:
+        rest = far & ~twin
+        conf = max(conf, (top - float(h[rest].max())) / top) if rest.any() else conf
+    return conf
+
+
+def _pile(t, w, period, center, half=0.08):
+    """Weighted centre of the events within ±half a period-fraction of `center`.
+    Returns (phase, share of all event weight in the pile, number of events in it)."""
+    import numpy as np
+    if len(t) == 0 or np.sum(w) <= 0:
+        return center % period, 0.0, 0
+    ws, n = 0.0, 0
     for _ in range(3):
-        z = np.sum(w * np.exp(2j * np.pi * t / p))
-        ph = (np.angle(z) % (2 * np.pi)) * p / (2 * np.pi)
-        idx = np.round((t - ph) / p)
-        near = np.abs(t - ph - idx * p) < 0.1 * p
-        if near.sum() < 16:
-            break
-        slope, _ = np.polyfit(idx[near], t[near], 1, w=np.sqrt(w[near]))
-        if abs(slope - p) > step * 8:
-            break
-        p = float(slope)
-    return p
+        d = ((t - center + period / 2) % period) - period / 2
+        near = np.abs(d) < half * period
+        ws, n = float(np.sum(w[near])), int(near.sum())
+        if ws <= 0:
+            return center % period, 0.0, 0
+        center = center + float(np.sum(w[near] * d[near]) / ws)
+    return center % period, ws / float(np.sum(w)), n
 
 
-def _attack_phase(y, sr, period):
-    """Circular mean of kick attacks on a grid of `period`. Returns (phase, concentration 0..1)."""
-    import numpy as np
-    t, w = _kick_attacks(y, sr)
-    if len(t) < 4 or w.sum() <= 0:
-        return None, 0.0
-    z = np.sum(w * np.exp(2j * np.pi * t / period))
-    conc = float(abs(z) / w.sum())
-    ph = (np.angle(z) % (2 * np.pi)) * period / (2 * np.pi)
-    # Second pass: only attacks near the pulse (drops off-beat hats / bass notes)
-    near = np.abs(((t - ph + period / 2) % period) - period / 2) < 0.15 * period
-    if near.sum() >= 4:
-        z2 = np.sum(w[near] * np.exp(2j * np.pi * t[near] / period))
-        ph = (np.angle(z2) % (2 * np.pi)) * period / (2 * np.pi)
-    return float(ph), conc
-
-
-def _fit_grid(y, sr, beat_times, fallback_bi):
+def _beat_phase(kick, snare, onset, period, read_kick=None):
     """
-    Fit a constant beat grid (interval, phase) to the song.
-    Interval: least-squares line through the tracked beats (outliers dropped).
-    Phase: snapped to the kick attacks when they form a clear pulse — more
-    precise than beat-tracker peaks, and immune to it locking onto hi-hats.
-    Returns (beat_interval_sec, phase_sec, kick_concentration) with 0 <= phase < interval.
+    Where the beat sits inside the period (0 <= phase < period).
+    Three witnesses are folded onto one beat and vote: the kicks, the snares / claps (the
+    backbeat) and every onset. Each vote counts as much as it is sure of itself, so a
+    syncopated kick (funk, trap) is overruled by a steady backbeat, and a syncopated snare
+    (dembow) by a steady kick — one of them alone used to put the grid a half or a quarter
+    beat off. The phase itself is then read from the kick attacks when they form a clear pile
+    (1 ms precise), otherwise from the onsets. `read_kick`: kick attacks to read that phase
+    from instead (the stretched song as it will be heard), after the vote on the clean ones.
     """
     import numpy as np
-    bt = np.asarray(beat_times, dtype=float)
-    bi, ph = float(fallback_bi), float(bt[0]) if len(bt) else 0.0
-    if len(bt) >= 4:
-        med = float(np.median(np.diff(bt)))
-        if med > 0:
-            # Beat index from consecutive gaps (tolerates skipped beats without
-            # accumulating the frame-quantisation error of the median).
-            k = np.concatenate([[0], np.cumsum(np.maximum(1, np.round(np.diff(bt) / med)))])
-            slope, icpt = np.polyfit(k, bt, 1)
-            good = np.abs(bt - (slope * k + icpt)) < 0.2 * med
-            if good.sum() >= 4:
-                slope, icpt = np.polyfit(k[good], bt[good], 1)
-            if 0.5 * med < slope < 1.5 * med:
-                bi, ph = float(slope), float(icpt)
-    conc = 0.0
-    try:
-        ph2, conc = _attack_phase(y, sr, bi)
-        if ph2 is not None and conc > 0.4:
-            ph = ph2
-    except Exception:
-        pass
-    return bi, ph % bi, conc
+    arr = lambda ev: (np.asarray(ev[0], dtype=float), np.asarray(ev[1], dtype=float))
+    kick, snare, onset = arr(kick), arr(snare), arr(onset)
+    read_kick = kick if read_kick is None else arr(read_kick)
+    H = np.zeros(_FOLD_BINS)
+    votes = 0
+    for (t, w), base in ((kick, 1.0), (snare, 1.0), (onset, 0.5)):
+        if len(t) >= 8 and np.sum(w) > 0:
+            h = _fold_hist(t, w, period)
+            H += h * base * (0.15 + _vote_conf(h))
+            votes += 1
+    if not votes:
+        return {'phase': 0.0, 'conf': 0.0, 'half': 1.0, 'kick_ok': False, 'kick': (0.0, 0.0, 0),
+                'onset': (0.0, 0.0, 0), 'doubt': lambda frac: 1.0}
+    k = int(np.argmax(H))
+    opp = [(k + _FOLD_BINS // 2 + d) % _FOLD_BINS for d in range(-4, 5)]
+    half = float(H[opp].max() / (H[k] + 1e-12))       # 0 = surely this beat … 1 = may be the off-beat
+    c = (k + 0.5) / _FOLD_BINS * period
+    pk = _pile(read_kick[0], read_kick[1], period, c)
+    po = _pile(onset[0], onset[1], period, c)
+    kick_ok = pk[2] >= 8 and pk[1] >= 0.2
+    def doubt(frac):                                   # the same, for a grid that may be `frac` of a beat off
+        m = int(round(frac * _FOLD_BINS))
+        side = [(k + sgn * m + d) % _FOLD_BINS for sgn in (1, -1) for d in range(-4, 5)]
+        return min(1.0, float(H[side].max() / (H[k] + 1e-12)))
+    return {'phase': pk[0] if kick_ok else po[0], 'conf': max(pk[1], po[1]), 'half': min(1.0, half),
+            'kick_ok': kick_ok, 'kick': pk, 'onset': po, 'doubt': doubt}
+
+
+WANDER_MIN = 0.012           # s: a beat that strays less than this from a steady grid is left alone
+WANDER_MAX_RATE = 0.05       # the most the song is sped up / slowed down locally to follow it
+
+
+def _beat_wander(t, w, period, phase, dur, hop_beats=2.0, win_beats=8.0):
+    """
+    How far the real beat strays from the steady grid (`period`, `phase`) over time: music
+    played without a click (live drums, older records, DJ sets, sped-up edits) speeds up and
+    slows down, and one tempo for the whole file then fits only part of it.
+    The beat is followed window by window (8 beats wide), each starting from where the last
+    one found it. Returns (times, deviation in s) — the beat near `times[i]` falls
+    `deviation[i]` later than the grid says — or None when the beat is steady, or can't be
+    followed reliably (then nothing is corrected, as before).
+    """
+    import numpy as np
+    t, w = np.asarray(t, dtype=float), np.asarray(w, dtype=float)
+    if len(t) < 16 or period <= 0 or dur < 6 * period:
+        return None
+    hop, half = hop_beats * period, win_beats * period / 2.0
+    centres = np.arange(half / 2.0, dur, hop)
+    if len(centres) < 4:
+        return None
+    dev = np.full(len(centres), np.nan)
+    cur = 0.0
+    for i, c in enumerate(centres):
+        a, b = np.searchsorted(t, (c - half, c + half))
+        if b - a < 4:
+            continue
+        p, share, n = _pile(t[a:b], w[a:b], period, phase + cur, half=0.1)
+        if n >= 4 and share >= 0.3:
+            cur += ((p - (phase + cur) + period / 2.0) % period) - period / 2.0
+            dev[i] = cur
+    ok = ~np.isnan(dev)
+    if ok.sum() < 4 or ok.mean() < 0.6:
+        return None
+    dev = np.interp(centres, centres[ok], dev[ok])
+    if len(dev) >= 5:                                       # one odd window is not a tempo change
+        pad = np.pad(dev, 1, mode='edge')
+        dev = np.median(np.stack([pad[:-2], pad[1:-1], pad[2:]]), axis=0)
+        pad = np.pad(dev, 1, mode='edge')
+        dev = 0.25 * pad[:-2] + 0.5 * pad[1:-1] + 0.25 * pad[2:]
+    if float(np.percentile(dev, 95) - np.percentile(dev, 5)) < WANDER_MIN:
+        return None
+    step = np.clip(np.diff(dev), -WANDER_MAX_RATE * hop, WANDER_MAX_RATE * hop)
+    dev = dev[0] + np.concatenate([[0.0], np.cumsum(step)])
+    # Proof before anything is bent: with the wander taken out, clearly more of the hits must
+    # land on the grid. A busy, syncopated but steady beat can look like wander window by
+    # window; it fails this test and is left alone.
+    on_grid = lambda tt: float(np.sum(w[np.abs(((tt - phase + period / 2.0) % period) - period / 2.0) < 0.012]))
+    before, after = on_grid(t), on_grid(t - np.interp(t, centres, dev))
+    if after < 1.2 * before or after - before < 0.05 * float(np.sum(w)):
+        return None
+    return centres, dev
+
+
+def _wander_at(wander, t):
+    """Deviation (s) at the times `t` (held flat before the first / after the last window)."""
+    import numpy as np
+    return np.interp(np.asarray(t, dtype=float), wander[0], wander[1])
+
+
+def _warp_audio(y, sr, src_time, n_out):
+    """y read at the (slowly varying) times src_time(t_out) — a turntable that follows a map.
+    `src_time`: seconds → seconds, vectorised. 4-point (Catmull-Rom) interpolation, in chunks.
+    The speed changes by a few percent at most, so the pitch moves by less than anyone hears."""
+    import numpy as np
+    y2 = y if y.ndim > 1 else y[None, :]
+    n = y2.shape[-1]
+    out = np.zeros((y2.shape[0], n_out), dtype=np.float32)
+    chunk = 1 << 19
+    for a in range(0, n_out, chunk):
+        b = min(n_out, a + chunk)
+        x = src_time(np.arange(a, b, dtype=np.float64) / sr) * sr
+        inside = (x >= 0) & (x <= n - 1)
+        i = np.clip(np.floor(x).astype(np.int64), 0, max(0, n - 1))
+        f = (x - i).astype(np.float32)
+        i0, i2, i3 = np.clip(i - 1, 0, n - 1), np.clip(i + 1, 0, n - 1), np.clip(i + 2, 0, n - 1)
+        for c in range(y2.shape[0]):
+            p0, p1, p2, p3 = y2[c, i0], y2[c, i], y2[c, i2], y2[c, i3]
+            v = p1 + 0.5 * f * (p2 - p0 + f * (2 * p0 - 5 * p1 + 4 * p2 - p3 + f * (3 * (p1 - p2) + p3 - p0)))
+            out[c, a:b] = np.where(inside, v, 0.0)
+    return out if y.ndim > 1 else out[0]
+
+
+def _steady_map(wander):
+    """For a source whose beat strays by `wander`: (to_grid, from_grid), both seconds → seconds.
+    to_grid(t) = where the moment t would be if the beat were steady; from_grid is its inverse."""
+    import numpy as np
+    src = np.asarray(wander[0], dtype=float)
+    grid = src - np.asarray(wander[1], dtype=float)
+    grid = np.maximum.accumulate(grid + np.arange(len(grid)) * 1e-9)
+
+    def line(x, xp, fp):                                    # np.interp, continued with slope 1 outside
+        x = np.asarray(x, dtype=float)
+        return np.where(x < xp[0], fp[0] + (x - xp[0]), np.where(x > xp[-1], fp[-1] + (x - xp[-1]),
+                                                                   np.interp(x, xp, fp)))
+    return (lambda t: line(t, src, grid)), (lambda t: line(t, grid, src))
+
+
+def _steady_feat(feat, rate, wander, sr, hop=None):
+    """The analysis envelopes of a source, played at `rate` and with its beat made steady."""
+    import numpy as np
+    fps = sr / (hop or HOP)
+    from_grid = _steady_map(wander)[1]
+    out = {}
+    for k, v in feat.items():
+        if not hasattr(v, '__len__'):
+            out[k] = v
+            continue
+        e = _retime(v, rate)
+        n = int(_steady_map(wander)[0](len(e) / fps) * fps)
+        out[k] = np.interp(from_grid(np.arange(max(1, n)) / fps) * fps, np.arange(len(e)), e, left=0.0, right=0.0)
+    return out
+
+
+ALIGN_BANDS = ('low_env', 'oenv_perc')        # kick on kick, and snare / hats on snare / hats
+OFFGRID_WEIGHT = 0.8                          # a half-step candidate has to be clearly better to win
+OFFGRID_RANGE = (0.55, 0.95)                  # … how clearly depends on how sure the beat grids are
+ALIGN_DRUMS = 3.0                             # weight of kick-on-kick + snare-on-snare next to those
+ALIGN_CROSS = 1.5                             # … minus this much for kick-on-snare / snare-on-kick
+MAX_ALTS = 7                                  # other placements offered by "Try another match"
+
+
+def _align(vid_feat, song_feat, sr, bi, pv, ps, step, bar_beats=4, vid_rate=1.0, song_rate=1.0, free=False,
+           off_weight=None):
+    """
+    Where in the song the video should start.
+
+    Both sources are already on the same tempo (`*_rate` = the speed each one plays at in the
+    output); `bi` is the beat interval, `pv` / `ps` the beat phase of video / song, all in output
+    time. Every offset that puts a song beat on a video beat is a candidate — `ps - pv` plus a
+    whole number of beats — and so are the `step`s in between (half a beat, so a grid that was
+    read half a beat off can still be put right; those have to be clearly better to win). Each
+    one is scored by how well the two rhythms overlap: the kick band and
+    the percussive band are cross-correlated over the whole video with one FFT, so long videos
+    cost the same as short ones.
+
+    Returns (offset_sec, alternatives): alternatives are the other placements inside one bar
+    around the winner, best first — what "Try another match" steps through.
+    `free`: neither source has a clear beat; take the best-overlapping offset as it is.
+    """
+    import numpy as np
+    from scipy.signal import correlate
+
+    fps = sr / HOP
+    off_w = OFFGRID_WEIGHT if off_weight is None else off_weight
+    corr, drums, nv, ns = None, None, 0, 0
+    for band in ALIGN_BANDS:
+        v = _retime(vid_feat[band], vid_rate)
+        s = _retime(song_feat[band], song_rate)
+        v = v / (np.max(v) + 1e-9)
+        s = s / (np.max(s) + 1e-9)
+        c = correlate(s, v, mode='full', method='fft')      # c[L+nv-1] = Σ song[i+L]·vid[i]
+        corr = c if corr is None else corr + c
+        nv, ns = len(v), len(s)
+    if ALIGN_DRUMS > 0 and 'kick_env' in vid_feat and 'kick_env' in song_feat:
+        # Kick on kick and snare on snare — and not one on the other. The bands above only ask
+        # "does something hit here in both?", so a placement one beat late (the song's kick on the
+        # video's snare) scored almost as well as the right one, and often won.
+        unit = lambda e: e / (math.sqrt(float(np.mean(e * e))) + 1e-9)
+        xc = lambda a, b: correlate(a, b, mode='full', method='fft')
+        vk, sk = (unit(_retime(f['kick_env'], r)) for f, r in ((vid_feat, vid_rate), (song_feat, song_rate)))
+        vm, sm = (unit(_retime(f['mid_env'], r)) for f, r in ((vid_feat, vid_rate), (song_feat, song_rate)))
+        d = xc(sk, vk) + xc(sm, vm) - ALIGN_CROSS * (xc(sk, vm) + xc(sm, vk))
+        top = float(np.max(d))
+        if top > 0:
+            drums = np.convolve(ALIGN_DRUMS * np.maximum(d, 0.0) * (float(np.max(corr)) / top),
+                                np.ones(3) / 3.0, mode='same')
+    low_song = _retime(song_feat['low_env'], song_rate)
+    low_song = low_song / (np.max(low_song) + 1e-9)
+    corr = np.convolve(corr, np.ones(3) / 3.0, mode='same')
+    xs = np.arange(len(corr), dtype=float)
+
+    def overlap(off):                                        # score of an offset (s), any shape
+        return np.interp(np.asarray(off, dtype=float) * fps + nv - 1, xs, corr, left=0.0, right=0.0)
+
+    def drum_fit(off):                                       # kick on kick, snare on snare (0 = unknown)
+        if drums is None:
+            return np.zeros(np.shape(off))
+        return np.interp(np.asarray(off, dtype=float) * fps + nv - 1, xs, drums, left=0.0, right=0.0)
+
+    song_len = ns / fps
+    if free:
+        lags = np.arange(0, max(1, ns - nv + 1))
+        base = float(lags[int(np.argmax(corr[lags + nv - 1]))]) / fps
+        ps = pv + base                                       # the grid follows the overlap
+    base = (ps - pv) % step
+    offs = base + step * np.arange(0, max(1, int(math.ceil((song_len - base) / step))))
+    lag = offs * fps
+    ov = np.minimum(nv, ns - lag)
+
+    def on_grid(off):                                        # does it put the song's beat on the video's?
+        # every 2 steps: one beat of the result, or of the song when its own beat is finer
+        d = (np.asarray(off, dtype=float) - (ps - pv) + step) % (2 * step) - step
+        return np.abs(d) < 0.25 * step
+    weight = np.where(on_grid(offs), 1.0, off_w)
+    score = overlap(offs) * weight
+    fits = lag + nv <= ns
+    usable = ov >= 0.5 * min(nv, ns)
+    if np.any(fits & usable):
+        pool = np.flatnonzero(fits & usable)
+    elif np.any(usable):
+        # Video longer than what is left of the song: use as much of the song as possible —
+        # one of the placements inside its first bar.
+        first = np.flatnonzero(usable)
+        pool = first[offs[first] < offs[first[0]] + bar_beats * bi - 1e-6]
+    else:
+        return max(0.0, float(base)), []
+    # Prefer a part of the song with strong kicks (same idea as before), among the best overlaps.
+    top = pool[np.argsort(score[pool])[::-1][:64]]
+    final = {}
+    for i in top:
+        a = int(lag[i])
+        seg = low_song[a:a + int(ov[i])]
+        k = max(1, len(seg) // 20)
+        bonus = 0.2 * float(np.sum(np.partition(seg, len(seg) - k)[-k:])) if len(seg) else 0.0
+        final[int(i)] = float(score[i]) + bonus * float(weight[i])
+    best = max(final, key=final.get)
+    if drums is not None:
+        # That settled where the beat is (on the grid or half a step off it). Which beat of the
+        # bar is a separate question, asked only among the placements that keep that answer —
+        # otherwise a syncopated snare (dembow, funk) would drag the song half a beat off to
+        # meet the video's backbeat.
+        d = (offs - offs[best] + step) % (2 * step) - step
+        same = pool[np.abs(d[pool]) < 0.25 * step]
+        drum = drum_fit(offs)
+        cand = same[np.argsort((score + drum)[same])[::-1][:64]]
+        final2 = {}
+        for i in cand:
+            a = int(lag[i])
+            seg = low_song[a:a + int(ov[i])]
+            k = max(1, len(seg) // 20)
+            bonus = 0.2 * float(np.sum(np.partition(seg, len(seg) - k)[-k:])) if len(seg) else 0.0
+            final2[int(i)] = float(score[i] + drum[i]) + bonus * float(weight[i])
+        if final2:
+            best = max(final2, key=final2.get)
+    best_off = float(offs[best])
+
+    # The other placements within one bar of the winner (earlier ones if the song ends too soon).
+    n_bar = max(2, int(round(bar_beats * bi / step)))
+    alts = []
+    for j in range(1, n_bar):
+        o = best_off + j * step
+        if o * fps + nv > ns and o - n_bar * step >= 0:
+            o -= n_bar * step
+        if o < 0:
+            continue
+        alts.append((float(o), float(overlap(o) + drum_fit(o)) * (1.0 if on_grid(o) else off_w)))
+    alts.sort(key=lambda a: -a[1])
+    return best_off, alts[:MAX_ALTS]
+
+
+def _sync_analysis(vid_y, song_hq, sr, render_sr, bpm_mode='video', tempo_mult='auto', preserve_pitch=True,
+                   step=None, check=None, info=None, warn=None):
+    """
+    Everything between "audio loaded" and "ready to render": both tempos, the stretch, the beat
+    grid and where the song starts. `vid_y`: the video's audio (mono, `sr`); `song_hq`: the song
+    (`render_sr`, mono or stereo). The callbacks report progress / allow cancelling; without them
+    this is a plain function (used by the tests).
+    """
+    import numpy as np
+    import librosa
+    step = step or (lambda msg, pct: None)
+    check = check or (lambda: None)
+    info = info or (lambda d: None)
+    warn = warn or (lambda msg: None)
+    mono = lambda a: a.mean(axis=0) if a.ndim > 1 else a
+
+    song_y = librosa.resample(librosa.to_mono(song_hq), orig_sr=render_sr, target_sr=sr)
+
+    # Video and song are analysed at the same time (independent work, separate CPU cores).
+    step('Detecting video and song BPM...', 28)
+
+    def analyse(y):
+        feat = _analysis_features(y, sr)
+        return feat, _detect_bpm(y, sr, feat)
+    with ThreadPoolExecutor(2) as ex:
+        f_vid, f_song = ex.submit(analyse, vid_y), ex.submit(analyse, song_y)
+        vid_feat, (vid_tempo, _, vid_conf, vid_music_start, _, vid_x) = f_vid.result()
+        check()
+        step('Detecting song BPM...', 38)
+        song_feat, (song_tempo, _, song_conf, song_music_start, _, song_x) = f_song.result()
+    del song_y                               # features hold everything the analysis needs
+    check()
+    info({'vid_music_start': round(vid_music_start / sr, 2), 'song_music_start': round(song_music_start / sr, 2)})
+
+    # Half / double time: count the song's beat at ½, 1 or 2 so it isn't stretched (or the video
+    # sped up) by 2× when the tempos are an octave apart (e.g. 160 BPM video, 80 BPM song).
+    song_tempo_detected = song_tempo
+    mult = _pick_tempo_mult(vid_tempo, song_tempo) if tempo_mult == 'auto' else float(tempo_mult)
+    song_tempo = song_tempo * mult
+    mult_note = {0.5: ' (song counted in half time)', 2.0: ' (song counted in double time)',
+                 1.0: ''}.get(mult, f' (song beat counted ×{mult:g})')
+
+    video_speed = None
+    stretch_ratio = 1.0
+    engine = 'none'
+    if bpm_mode == 'song':
+        video_speed = song_tempo / vid_tempo if vid_tempo > 0 else 1.0
+        step(f'Keeping song tempo ({song_tempo:.2f} BPM{mult_note}); video will play at {video_speed:.3f}x...', 46)
+        preserve = resample = song_hq
+        mp3_stretch = vid_tempo / song_tempo if song_tempo > 0 else 1.0
+    else:
+        stretch_ratio = vid_tempo / song_tempo if song_tempo > 0 else 1.0
+        mp3_stretch = 1.0
+        if abs(stretch_ratio - 1.0) <= 2e-5:
+            stretch_ratio = 1.0
+            step(f'BPMs already match{mult_note} — no stretch needed...', 46)
+            preserve = resample = song_hq
+        elif abs(stretch_ratio - 1.0) <= 3e-3:
+            # Almost the same tempo. Leaving the song alone (as before) let it drift: 0.1% is
+            # 60 ms a minute. A time-stretch this small only adds artefacts, so the song is
+            # resampled instead — exact tempo, and a pitch change nobody can hear (≤ 5 cents).
+            step(f'BPMs almost match{mult_note} — fine-tuning the song by {(stretch_ratio - 1) * 100:+.2f}%...', 46)
+            preserve = resample = librosa.resample(song_hq, orig_sr=render_sr * stretch_ratio, target_sr=render_sr)
+            engine = 'resample'
+        else:
+            step(f'Stretching the song {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x){mult_note}...', 46)
+            with ThreadPoolExecutor(1) as ex:    # the turntable version is made alongside
+                f_res = ex.submit(librosa.resample, song_hq, orig_sr=render_sr * stretch_ratio,
+                                  target_sr=render_sr)
+                preserve, engine = _time_stretch(song_hq, render_sr, stretch_ratio)
+                resample = f_res.result()
+    check()
+
+    vs = video_speed or 1.0
+    if bpm_mode == 'song':
+        target_tempo = song_tempo
+    else:                                        # the song's real tempo after the stretch
+        target_tempo = song_tempo * stretch_ratio
+    info({'vid_bpm': round(vid_tempo, 4), 'vid_confidence': vid_conf,
+          'song_bpm': round(song_tempo_detected, 4), 'song_confidence': song_conf,
+          'tempo_mult': mult, 'tempo_mult_auto': tempo_mult == 'auto',
+          'video_speed': round(vs, 4), 'target_bpm': round(target_tempo, 4), 'mode': bpm_mode,
+          'stretch': round(stretch_ratio, 4), 'stretch_engine': engine})
+    low = [n for n, c in (('video', vid_conf), ('song', song_conf)) if c < 0.3]
+    if low:
+        warn(f'No steady beat found in the {" and ".join(low)} — the match may be off. '
+             'Play the preview and press "Try another match" if it is.')
+
+    step('Locking beat grid to the kick drum...', 56)
+    bi = 60.0 / target_tempo                     # the beat of the result (output time)
+    # The song's own beat can be finer than that (a fast song counted in half time): any of its
+    # beats may then sit on a video beat.
+    q = min(bi, bi * mult) if mult > 0 else bi
+    q = max(q, bi / 4.0)
+    # Video: events in output time.
+    vid_kick = (vid_x['kick'][0] / vs, vid_x['kick'][1])
+    vid_onset = (vid_x['onset'][0] / vs, vid_x['onset'][1])
+    vid_snare = (vid_x['snare'][0] / vs, vid_x['snare'][1])
+    pvd = _beat_phase(vid_kick, vid_snare, vid_onset, bi)
+    # Song: the kicks are measured on the audio that will actually be heard (the HQ render),
+    # because a phase-vocoder stretch moves transients by a few ms.
+    # Which beat it is, is decided on the clean, unstretched analysis; only the fine reading
+    # comes from the stretched audio.
+    song_kick = (song_x['kick'][0] / stretch_ratio, song_x['kick'][1])
+    song_onset = (song_x['onset'][0] / stretch_ratio, song_x['onset'][1])
+    song_snare = (song_x['snare'][0] / stretch_ratio, song_x['snare'][1])
+    # (Not after the built-in fallback stretch: it smears every kick ~15 ms to both sides, the
+    # attack is then read early and the whole song placed that much late. Rubber Band keeps them.)
+    kick_p = None if preserve is song_hq or engine == 'librosa' else _kick_attacks(mono(preserve), render_sr)
+    psd = _beat_phase(song_kick, song_snare, song_onset, bi, read_kick=kick_p)
+    check()
+
+    # A beat that speeds up and slows down (no click track). One tempo then fits only part of
+    # the file — the classic "it is in sync at the start and off by the end".
+    #   song  → made steady here, once: every beat is moved onto the grid.
+    #   video → can't be changed, so the song is bent to follow it when it is cut (_slice_audio).
+    # Only when the song is the one being stretched (Match Video); Match Song promises to leave it.
+    vid_wander = song_wander = None
+    if bpm_mode != 'song':
+        ev = lambda d, kick, onset: kick if d['kick_ok'] else onset
+        song_wander = _beat_wander(*ev(psd, kick_p if kick_p is not None else song_kick, song_onset), bi,
+                                   psd['phase'], preserve.shape[-1] / render_sr)
+        vid_wander = _beat_wander(*ev(pvd, vid_kick, vid_onset), bi, pvd['phase'], len(vid_y) / sr)
+    if song_wander is not None:
+        to_grid, from_grid = _steady_map(song_wander)
+        n_out = int(float(to_grid(preserve.shape[-1] / render_sr)) * render_sr)
+        same = resample is preserve
+        preserve = _warp_audio(preserve, render_sr, from_grid, n_out)
+        resample = preserve if same else _warp_audio(resample, render_sr, from_grid, n_out)
+        fix = lambda e: (to_grid(e[0]), e[1])
+        song_kick, song_onset, song_snare = fix(song_kick), fix(song_onset), fix(song_snare)
+        kick_p = None if kick_p is None else fix(kick_p)
+        psd = _beat_phase(song_kick, song_snare, song_onset, bi, read_kick=kick_p)
+        song_feat = _steady_feat(song_feat, stretch_ratio, song_wander, sr)
+        engine = engine if engine != 'none' else 'resample'
+        info({'song_wander_ms': round(float(np.ptp(song_wander[1])) * 1000)})
+    if vid_wander is not None:
+        to_grid = _steady_map(vid_wander)[0]
+        fix = lambda e: (to_grid(e[0]), e[1])
+        vid_kick, vid_onset, vid_snare = fix(vid_kick), fix(vid_onset), fix(vid_snare)
+        pvd = _beat_phase(vid_kick, vid_snare, vid_onset, bi)
+        vid_feat = _steady_feat(vid_feat, 1.0, vid_wander, sr)
+        info({'vid_wander_ms': round(float(np.ptp(vid_wander[1])) * 1000)})
+    if song_wander is not None or vid_wander is not None:
+        who = ' and '.join(n for n, x in (('video', vid_wander), ('song', song_wander)) if x is not None)
+        warn(f'The tempo of the {who} is not steady (played without a click) — the song is bent to follow the '
+             'beat. If it still slips, trim to a shorter part.')
+    check()
+    feat_rate = 1.0 if song_wander is not None else stretch_ratio      # song_feat is in output time then
+    use_kick = pvd['kick_ok'] and psd['kick_ok']
+    pv = pvd['kick'][0] if use_kick else pvd['onset'][0]
+    gp_preserve = psd['kick'][0] if use_kick else psd['onset'][0]
+    gp_resample = gp_preserve
+    if resample is not preserve and use_kick and song_wander is None:
+        kr = _kick_attacks(mono(resample), render_sr)
+        pr = _pile(kr[0], kr[1], bi, gp_preserve)
+        if pr[2] >= 8:
+            gp_resample = pr[0]
+    check()
+    free = min(pvd['conf'], psd['conf']) < 0.2
+
+    # Bars: which grid beats carry the low end (in the song's own time).
+    song_len_out = preserve.shape[-1] / render_sr
+    grid_out = np.arange(gp_preserve % bi, song_len_out, bi)
+    downbeats_src, song_bpb = _detect_downbeats(song_feat['low_env'], sr, grid_out * feat_rate)
+    song_downbeats = np.atleast_1d(downbeats_src) / feat_rate
+    bpb = int(song_bpb) if song_bpb > 1 else 4
+
+    step('Finding beat-aligned match point...', 60)
+    ps = gp_preserve if preserve_pitch else gp_resample
+    # The grids decide where the beat is; the overlap of the rhythms may overrule them by half
+    # a beat only when it is much better — and the surer the grids are, the more it takes.
+    # (When the song's beat is finer than the result's — q < bi — the step in question is half
+    # of *that*, e.g. a quarter of bi; half a bi away is then simply the next beat.)
+    doubt = max(pvd['doubt'](q / 2.0 / bi), psd['doubt'](q / 2.0 / bi))
+    off_w = OFFGRID_RANGE[0] + (OFFGRID_RANGE[1] - OFFGRID_RANGE[0]) * doubt
+    best_off, alts = _align(vid_feat, song_feat, sr, bi, pv, ps, q / 2.0, bar_beats=bpb,
+                            vid_rate=vs, song_rate=feat_rate, free=free, off_weight=off_w)
+    if free:
+        gp_preserve = gp_resample = (best_off + pv) % bi
+        grid_out = np.arange(gp_preserve % bi, song_len_out, bi)
+    check()
+
+    return {
+        'vid_bpm': vid_tempo, 'song_bpm': song_tempo_detected, 'tempo_mult': mult, 'conf': (vid_conf, song_conf),
+        'stretch': stretch_ratio, 'video_speed': vs, 'video_speed_raw': video_speed, 'mp3_stretch': mp3_stretch,
+        'engine': engine, 'target_bpm': target_tempo,
+        'preserve': preserve, 'resample': resample,
+        'bi': bi, 'bpb': bpb, 'song_bpb': int(song_bpb),
+        'offset': best_off, 'alts': [{'offset': o, 'score': round(sc, 3)} for o, sc in alts],
+        'grid_phase': {'preserve': gp_preserve % bi, 'resample': gp_resample % bi},
+        'bar_phase': {'preserve': _bar_phase(song_downbeats, gp_preserve % bi, bi, bpb),
+                      'resample': _bar_phase(song_downbeats, gp_resample % bi, bi, bpb)},
+        'song_beat_times': grid_out, 'grid_source': 'overlap' if free else ('kick' if use_kick else 'onset'),
+        'vid_wander': None if vid_wander is None else [[round(float(x), 4) for x in a] for a in vid_wander],
+        'song_wander': song_wander is not None,
+    }
 
 
 def _bar_phase(downbeats, grid_phase, bi, bpb):
@@ -1375,6 +1816,20 @@ def _pitch_val(st, key):
     return v
 
 
+def _match_base(st):
+    """The placement nudges are counted from: the chosen match, moved by any whole-bar Jump."""
+    alts = st.get('alts') or [st['auto_offset_samples']]
+    i = min(max(int(st.get('match_i', 0)), 0), len(alts) - 1)
+    return alts[i] + st.get('jump_samples', 0.0)
+
+
+def _match_index(st):
+    """Which of the ranked placements (st['alts']) is playing, or None after a move by hand."""
+    if abs(st['offset_samples'] - _match_base(st)) > 0.002 * st['render_sr']:
+        return None
+    return int(st.get('match_i', 0))
+
+
 def _timing(st):
     """Offsets are in song time; beat interval / phases / BPM are in *output* time, so with an
     export speed they describe the result as it plays (effects, preview LEDs, the BPM shown)."""
@@ -1384,7 +1839,11 @@ def _timing(st):
     off = st['offset_samples'] / sr
     auto = st['auto_offset_samples'] / sr
     sp = _out_speed(st.get('opts'))
+    alts = st.get('alts') or [st['auto_offset_samples']]
     return {
+        # "Try another match": which of the ranked placements is playing (None = moved by hand)
+        'match': _match_index(st), 'match_count': len(alts),
+        'grid_source': st.get('grid_source', ''),
         'offset': round(off, 4),
         'auto_offset': round(auto, 4),
         'delta_ms': round((off - auto) * 1000, 1),
@@ -1933,6 +2392,24 @@ def _slice_audio(st, out_wav):
     off = int(round(st['offset_samples'] / sp))
     total = sf.info(full).frames
     start, pad = max(0, off), max(0, -off)
+    wander = st.get('vid_wander')
+    if wander:
+        # The video's beat is not steady: read the song along the video's own beat instead of
+        # straight through (see _sync_analysis).
+        w = (np.asarray(wander[0]) / sp, np.asarray(wander[1]) / sp)
+        to_grid = _steady_map(w)[0]
+        lead = int((float(np.max(np.abs(w[1]))) + 0.05) * sr)
+        a, b = max(0, off - lead), min(total, max(0, off + need + lead))
+        src, _ = sf.read(full, start=a, stop=max(a, b), always_2d=True)
+        if len(src) < 4:
+            data = np.zeros((0, src.shape[1] if src.ndim > 1 else 1), dtype=np.float32)
+        else:
+            n_out = min(need, max(0, int((total - off) + 0)))
+            data = _warp_audio(src.T.astype(np.float32), sr, lambda t: to_grid(t) + (off - a) / sr, n_out).T
+            tail = np.flatnonzero(np.any(data != 0, axis=1))
+            data = data[:int(tail[-1]) + 1] if len(tail) and off + need > total else data
+        sf.write(out_wav, data, sr)
+        return min(vid_out_dur, len(data) / sr)
     stop = min(total, start + max(0, need - pad))
     data, _ = sf.read(full, start=start, stop=stop, always_2d=True)
     if pad:
@@ -2112,112 +2589,22 @@ def _run(job_id, p):
             _step(job_id, 'Loading audio...', 20)
             vid_y, _ = librosa.load(vid_audio, sr=sr, mono=True)
             song_hq, _ = librosa.load(song_wav, sr=render_sr, mono=False)
-            song_y = librosa.resample(librosa.to_mono(song_hq), orig_sr=render_sr, target_sr=sr)
             if len(vid_y) < sr * 2:
                 raise RuntimeError('Video is too short to detect a beat (needs at least 2 seconds).')
             if vid_info['dur'] <= 0:
                 vid_info['dur'] = len(vid_y) / sr
 
-            # Video and song are analysed at the same time (independent work, separate CPU cores).
-            _step(job_id, 'Detecting video and song BPM...', 28)
-
-            def analyse(y):
-                feat = _analysis_features(y, sr)
-                return feat, _detect_bpm(y, sr, feat)
-            with ThreadPoolExecutor(2) as ex:
-                f_vid, f_song = ex.submit(analyse, vid_y), ex.submit(analyse, song_y)
-                vid_feat, (vid_tempo, vid_beats, vid_conf, vid_music_start, _) = f_vid.result()
-                _check_cancel(job_id)
-                _step(job_id, 'Detecting song BPM...', 38)
-                song_feat, (song_tempo, _, song_conf, song_music_start, song_beats) = f_song.result()
-            del song_y                       # features hold everything the analysis needs
-            _check_cancel(job_id)
-            _push(job_id, {'type': 'info', 'vid_music_start': round(vid_music_start / sr, 2),
-                           'song_music_start': round(song_music_start / sr, 2)})
-
-            # Half / double time: count the song's beat at ½, 1 or 2 so it isn't stretched (or the video
-            # sped up) by 2× when the tempos are an octave apart (e.g. 160 BPM video, 80 BPM song).
-            song_tempo_detected = song_tempo
-            mult_req = p.get('tempo_mult', 1.0)
-            tempo_mult = _pick_tempo_mult(vid_tempo, song_tempo) if mult_req == 'auto' else float(mult_req)
-            if tempo_mult != 1.0:
-                song_tempo = song_tempo * tempo_mult
-                song_beats = _retempo_beats(song_beats, tempo_mult, song_feat['low_env'], sr)
-            mult_note = {0.5: ' (song counted in half time)', 2.0: ' (song counted in double time)',
-                         1.0: ''}.get(tempo_mult, f' (song beat counted ×{tempo_mult:g})')
-
-            bpm_mode = p['bpm_mode']
-            video_speed = None
-            stretch_ratio = 1.0
-            engine = 'none'
-            if bpm_mode == 'song':
-                video_speed = song_tempo / vid_tempo if vid_tempo > 0 else 1.0
-                _step(job_id, f'Keeping song tempo ({song_tempo:.2f} BPM{mult_note}); video will play at '
-                              f'{video_speed:.3f}x...', 46)
-                preserve = resample = song_hq
-                mp3_stretch = vid_tempo / song_tempo if song_tempo > 0 else 1.0
-            else:
-                stretch_ratio = vid_tempo / song_tempo if song_tempo > 0 else 1.0
-                mp3_stretch = 1.0
-                if abs(stretch_ratio - 1.0) <= 1e-3:
-                    _step(job_id, f'BPMs already match{mult_note} — no stretch needed...', 46)
-                    preserve = resample = song_hq
-                else:
-                    _step(job_id, f'Stretching the song {song_tempo:.2f} → {vid_tempo:.2f} BPM ({stretch_ratio:.4f}x)'
-                                  f'{mult_note}...', 46)
-                    with ThreadPoolExecutor(1) as ex:    # the turntable version is made alongside
-                        f_res = ex.submit(librosa.resample, song_hq, orig_sr=render_sr * stretch_ratio,
-                                          target_sr=render_sr)
-                        preserve, engine = _time_stretch(song_hq, render_sr, stretch_ratio)
-                        resample = f_res.result()
-                    _check_cancel(job_id)
-            _check_cancel(job_id)
-
-            target_tempo = song_tempo if bpm_mode == 'song' else vid_tempo
-            _push(job_id, {'type': 'info', 'vid_bpm': round(vid_tempo, 4), 'vid_confidence': vid_conf,
-                           'song_bpm': round(song_tempo_detected, 4), 'song_confidence': song_conf,
-                           'tempo_mult': tempo_mult, 'tempo_mult_auto': mult_req == 'auto',
-                           'video_speed': round(video_speed or 1.0, 4),
-                           'target_bpm': round(target_tempo, 4), 'mode': bpm_mode,
-                           'stretch': round(stretch_ratio, 4), 'stretch_engine': engine})
-            low = [n for n, c in (('video', vid_conf), ('song', song_conf)) if c < 0.3]
-            if low:
-                _push(job_id, {'type': 'warn', 'msg': f'Low beat confidence on the {" and ".join(low)} — '
-                                                      'check the preview and nudge if needed.'})
-
-            _step(job_id, 'Finding beat-aligned match point...', 56)
-            # The stretch / speed-up is applied to the analysis by re-timing the
-            # features, not by stretching and re-analysing the audio.
-            best_off, song_beat_grid, song_downbeats, song_bpb = _find_beat_offset(
-                vid_feat, song_feat, vid_beats, song_beats, sr,
-                vid_rate=video_speed or 1.0, song_rate=stretch_ratio)
-            del vid_feat, song_feat
-            _check_cancel(job_id)
-
-            _step(job_id, 'Locking beat grid to the kick drum...', 60)
-            # The grid phase is measured on the audio that will actually be heard
-            # (the HQ render), because a phase-vocoder stretch smears transients
-            # in the low-res analysis copy by tens of ms.
-            mono = lambda a: a.mean(axis=0) if a.ndim > 1 else a
-            bi, gp_preserve, conc_p = _fit_grid(mono(preserve), render_sr, song_beat_grid, 60.0 / target_tempo)
-            if resample is preserve:
-                gp_resample, conc_r = gp_preserve, conc_p
-            else:
-                _, gp_resample, conc_r = _fit_grid(mono(resample), render_sr, song_beat_grid, 60.0 / target_tempo)
-            bpb = song_bpb if song_bpb > 1 else 4
-
-            # Micro-align: nudge the offset (max ±15% of a beat) so the song's kicks
-            # land exactly on the video's kicks. Only when both have a clear pulse.
+            r = _sync_analysis(
+                vid_y, song_hq, sr, render_sr, bpm_mode=p['bpm_mode'], tempo_mult=p.get('tempo_mult', 1.0),
+                preserve_pitch=p['preserve_pitch'],
+                step=lambda msg, pct: _step(job_id, msg, pct), check=lambda: _check_cancel(job_id),
+                info=lambda d: _push(job_id, dict(d, type='info')),
+                warn=lambda msg: _push(job_id, {'type': 'warn', 'msg': msg}))
+            del vid_y, song_hq
+            preserve, resample = r.pop('preserve'), r.pop('resample')
+            bpm_mode, video_speed, stretch_ratio = p['bpm_mode'], r['video_speed_raw'], r['stretch']
+            mp3_stretch, bi, bpb, song_bpb = r['mp3_stretch'], r['bi'], r['bpb'], r['song_bpb']
             micro_ms = 0.0
-            vs_ = video_speed or 1.0
-            pv, conc_v = _attack_phase(vid_y, sr, bi * vs_)
-            ps, conc_s = (gp_preserve, conc_p) if p['preserve_pitch'] else (gp_resample, conc_r)
-            if pv is not None and conc_v > 0.5 and conc_s > 0.5:
-                off_sec = best_off / sr
-                err = ((ps - off_sec - pv / vs_ + bi / 2) % bi) - bi / 2
-                if abs(err) < 0.15 * bi:
-                    best_off = int(round((off_sec + err) * sr))
-                    micro_ms = err * 1000
 
             _step(job_id, 'Writing high-quality audio...', 62)
 
@@ -2235,19 +2622,20 @@ def _run(job_id, p):
                 rn = _norm(resample)
                 sf.write(full_resample, rn.T if rn.ndim > 1 else rn, render_sr)
 
-            auto_off = int(round(best_off * render_sr / sr))
+            auto_off = int(round(r['offset'] * render_sr))
             st = {
                 'root_tmp': tmp,
                 'vid_file': vid_file, 'vid_info': vid_info, 'vid_trim': vid_trim,
                 'full_preserve_wav': full_preserve, 'full_resample_wav': full_resample,
                 'preserve_pitch': p['preserve_pitch'], 'render_sr': render_sr,
-                'auto_offset_samples': auto_off, 'offset_samples': auto_off,
+                'auto_offset_samples': auto_off, 'offset_samples': auto_off, 'match_i': 0, 'jump_samples': 0.0,
+                # Every placement worth trying, best first: [0] is the automatic match.
+                'alts': [auto_off] + [int(round(a['offset'] * render_sr)) for a in r['alts']],
                 'beat_interval': bi, 'beats_per_bar': int(song_bpb),
-                'grid_phase': {'preserve': gp_preserve, 'resample': gp_resample},
-                'bar_phase': {'preserve': _bar_phase(song_downbeats, gp_preserve, bi, bpb),
-                              'resample': _bar_phase(song_downbeats, gp_resample, bi, bpb)},
-                'micro_align_ms': round(micro_ms, 1),
-                'song_beat_times': [round(float(x), 4) for x in song_beat_grid],
+                'grid_phase': r['grid_phase'], 'bar_phase': r['bar_phase'],
+                'grid_source': r['grid_source'], 'vid_wander': r.get('vid_wander'),
+                'micro_align_ms': 0.0,
+                'song_beat_times': [round(float(x), 4) for x in r['song_beat_times']],
                 'song_duration': round(preserve.shape[-1] / render_sr, 2),
                 'video_speed': video_speed, 'bpm_mode': bpm_mode, 'stretch_ratio': stretch_ratio,
                 'mp3_stretch': mp3_stretch, 'opts': p['opts'],
@@ -2328,17 +2716,43 @@ def _derive(src_id, changes):
     auto = st['auto_offset_samples']
     off = float(st['offset_samples'])
 
+    alts = st.get('alts') or [auto]
     if changes.get('reset'):
-        off = auto
+        st['match_i'], st['jump_samples'] = 0, 0.0
+        off = float(auto)
+    if changes.get('match') is not None:
+        # "Try another match": one of the ranked placements ('next' / 'prev' step through them).
+        # It stays in the part of the song chosen with Jump; a nudge made by hand is dropped.
+        m, i = changes['match'], int(st.get('match_i', 0))
+        if m == 'next':
+            i = (i + 1) % len(alts)
+        elif m == 'prev':
+            i = (i - 1) % len(alts)
+        else:
+            i = int(_clamp(m, 0, len(alts) - 1, 0))
+        st['match_i'] = i
+        off = float(_match_base(st))
+    if changes.get('match_steps'):
+        # The same, as a number of steps (several quick presses arrive as one request).
+        n = int(_clamp(changes['match_steps'], -64, 64, 0))
+        if _match_index(st) is None and n > 0:
+            n -= 1                               # moved by hand: the first press goes back to the match
+        st['match_i'] = (int(st.get('match_i', 0)) + n) % len(alts)
+        off = float(_match_base(st))
     if changes.get('seek_to') is not None:
+        # Whole bars from where the song sits now, so the beats (and any nudge) stay as they are.
+        # (It used to count from the automatic match, which silently undid a nudge.)
         target = _clamp(changes['seek_to'], 0, st['song_duration'], 0) * sr
-        off = auto + round((target - auto) / bar_s) * bar_s        # whole bars keep downbeats aligned
+        jump = round((target - off) / bar_s) * bar_s
+        off += jump
+        st['jump_samples'] = st.get('jump_samples', 0.0) + jump
     off += _clamp(changes.get('beats', 0), -64, 64, 0) * bi_s
     off += _clamp(changes.get('ms', 0), -5000, 5000, 0) / 1000.0 * sr
     lock = changes.get('lock')
     if lock in LOCK_UNITS:
+        base = _match_base(st)                   # the grid of the chosen match, not always the first
         unit = (LOCK_UNITS[lock] or _bpb(st)) * bi_s
-        off = auto + round((off - auto) / unit) * unit
+        off = base + round((off - base) / unit) * unit
 
     vs = st.get('video_speed') or 1.0
     vid_out = st['vid_info']['dur'] / vs
@@ -2600,7 +3014,7 @@ def api_start():
 def api_adjust():
     """
     Body: {job_id, beats?, ms?, lock?: bar|beat|half|quarter|eighth, reset?, seek_to?,
-           preserve_pitch?, opts?: {...}}
+           match?: 'next' | 'prev' | index, match_steps?: ±n, preserve_pitch?, opts?: {...}}
     """
     d = request.json or {}
     new_id, err = _derive((d.get('job_id') or '').strip(), d)
@@ -2841,7 +3255,7 @@ def api_bpm():
         import librosa
         audio = _dl_audio(url, tmp, 'bpm_check')
         y, sr = librosa.load(audio, sr=22050, mono=True)
-        bpm, _, confidence, music_start, _ = _detect_bpm(y, sr)
+        bpm, _, confidence, music_start, _, _ = _detect_bpm(y, sr)
         return jsonify({'bpm': bpm, 'confidence': confidence, 'music_starts_at': round(music_start / sr, 2)})
     except Exception as e:
         return jsonify({'error': _friendly(e)}), 500
